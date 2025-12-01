@@ -241,7 +241,7 @@ app.get('/stores/:storeId/products', async (req, res) => {
 
 // ------------------ 서버 시작 ------------------
 
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 10000;
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
