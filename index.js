@@ -47,16 +47,7 @@ function hashInviteCode(code) {
     .digest('hex');
 }
 
-// 헬스체크용
-app.get('/health', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.json({ ok: true, now: result.rows[0].now });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+
 
 // ------------------ 1) 본사 생성 ------------------
 
