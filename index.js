@@ -77,7 +77,7 @@ app.post('/head-offices', async (req, res) => {
   }
 });
 
-// ------------------ 2) 초대 코드 생성 ------------------
+
 
 // ------------------ 2) 초대 코드 생성 ------------------
 
@@ -140,7 +140,9 @@ app.post('/stores/join', async (req, res) => {
   }
 
   try {
-    const codeHash = hashInviteCode(inviteCode.trim().toUpperCase());
+    const codeHash = hashInviteCode(
+      inviteCode.trim().toUpperCase()
+    );
 
     // 1. 초대코드 + 본사 이름까지 같이 조회
     const { rows } = await pool.query(
@@ -166,19 +168,30 @@ app.post('/stores/join', async (req, res) => {
     const invite = rows[0];
 
     // 2. DB에 저장할 매장 이름 만들기: 본사(지점)
-    const storeDisplayName =
-      invite.branch_name
-        ? `${invite.head_office_name}(${invite.branch_name})`
-        : invite.head_office_name;
+    const storeDisplayName = invite.branch_name
+      ? `${invite.head_office_name}(${invite.branch_name})`
+      : invite.head_office_name;
 
-    // 3. 매장 생성
+    // 3. 매장 생성 (여기서 name 파라미터는 무시!)
     const storeResult = await pool.query(
       `
-      INSERT INTO stores (head_office_id, name, business_no, phone, status, created_at)
+      INSERT INTO stores (
+        head_office_id,
+        name,
+        business_no,
+        phone,
+        status,
+        created_at
+      )
       VALUES ($1, $2, $3, $4, 'ACTIVE', NOW())
       RETURNING *;
       `,
-      [invite.head_office_id, storeDisplayName, businessNo || null, phone || null]
+      [
+        invite.head_office_id,
+        storeDisplayName,
+        businessNo || null,
+        phone || null,
+      ]
     );
 
     console.log('[/stores/join] new store =', storeResult.rows[0]);
@@ -199,9 +212,12 @@ app.post('/stores/join', async (req, res) => {
     });
   } catch (e) {
     console.error('[/stores/join] ERROR =', e);
-    return res.status(500).json({ message: '가맹점 가입 중 오류', error: e.message });
+    return res
+      .status(500)
+      .json({ message: '가맹점 가입 중 오류', error: e.message });
   }
 });
+
 
 
 // ------------------ 4) 가맹점 상품 목록 ------------------
