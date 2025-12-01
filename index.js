@@ -26,6 +26,8 @@ console.log('DB config in index.js =', {
 
 // 🔐 해시용 시크릿 (반드시 .env 에 INVITE_SECRET 넣어줘!)
 const INVITE_SECRET = process.env.INVITE_SECRET || 'CHANGE_ME_INVITE_SECRET';
+console.log('INVITE_SECRET in index.js =', INVITE_SECRET, 'len =', INVITE_SECRET.length);
+
 
 // ------------------ 유틸 함수 ------------------
 
@@ -77,6 +79,8 @@ app.post('/head-offices', async (req, res) => {
 
 // ------------------ 2) 초대 코드 생성 ------------------
 
+// ------------------ 2) 초대 코드 생성 ------------------
+
 app.post('/head-offices/:id/invite-codes', async (req, res) => {
   const headOfficeId = Number(req.params.id);
   const { maxUses = 10, daysValid = 7 } = req.body;
@@ -90,16 +94,19 @@ app.post('/head-offices/:id/invite-codes', async (req, res) => {
       const code = generateInviteCode(24);          // 평문 코드
       const codeHash = hashInviteCode(code);        // 🔐 해시
 
+      // ✅ 요기!
+      console.log('[invite-create] code =', code, 'codeHash =', codeHash);
+
       try {
         const result = await pool.query(
           `
           INSERT INTO head_office_invite_codes
-            (head_office_id, code_hash, max_uses, expires_at, status, used_count)
+            (head_office_id, code_hash, code_plain, max_uses, expires_at, status, used_count)
           VALUES
-            ($1, $2, $3, NOW() + ($4 || ' days')::interval, 'ACTIVE', 0)
+            ($1, $2, $3, $4, NOW() + ($5 || ' days')::interval, 'ACTIVE', 0)
           RETURNING id;
           `,
-          [headOfficeId, codeHash, maxUses, daysValid]
+          [headOfficeId, codeHash, code, maxUses, daysValid]
         );
 
         return res.status(201).json({
@@ -120,6 +127,7 @@ app.post('/head-offices/:id/invite-codes', async (req, res) => {
   }
 });
 
+
 // ------------------ 3) 가맹점 가입 (/stores/join) ------------------
 
 // 하나의 초대코드로 여러 가맹점 가입 가능 (max_uses까지)
@@ -136,6 +144,7 @@ app.post('/stores/join', async (req, res) => {
   try {
     // 🔐 입력받은 초대코드를 동일한 방식으로 해시
     const codeHash = hashInviteCode(inviteCode);
+    console.log('[/stores/join] inviteCode =', inviteCode, '→ codeHash =', codeHash);
 
     // 1. 코드 유효성 체크
     const { rows } = await pool.query(
@@ -263,4 +272,5 @@ app.get('/health', async (req, res) => {
     });
   }
 });
+
 
