@@ -135,26 +135,24 @@ app.post('/stores/join', async (req, res) => {
   const { inviteCode, name, businessNo, phone } = req.body;
   console.log('[/stores/join] body =', req.body);
 
-  if (!inviteCode || !name) {
-    return res
-      .status(400)
-      .json({ message: 'inviteCode와 매장 name 은 필수입니다.' });
+  if (!inviteCode) {
+    return res.status(400).json({ message: 'inviteCode는 필수입니다.' });
   }
 
   try {
-    // 🔐 입력받은 초대코드를 동일한 방식으로 해시
-    const codeHash = hashInviteCode(inviteCode);
-    console.log('[/stores/join] inviteCode =', inviteCode, '→ codeHash =', codeHash);
+    const codeHash = hashInviteCode(inviteCode.trim().toUpperCase());
 
-    // 1. 코드 유효성 체크
+    // 1. 초대코드 + 본사 이름까지 같이 조회
     const { rows } = await pool.query(
       `
-      SELECT *
-      FROM head_office_invite_codes
-      WHERE code_hash = $1
-        AND status = 'ACTIVE'
-        AND (expires_at IS NULL OR expires_at > NOW())
-        AND used_count < max_uses
+      SELECT i.*,
+             h.name AS head_office_name
+      FROM head_office_invite_codes i
+      JOIN head_offices h ON h.id = i.head_office_id
+      WHERE i.code_hash = $1
+        AND i.status = 'ACTIVE'
+        AND (i.expires_at IS NULL OR i.expires_at > NOW())
+        AND i.used_count < i.max_uses
       `,
       [codeHash]
     );
@@ -167,19 +165,25 @@ app.post('/stores/join', async (req, res) => {
 
     const invite = rows[0];
 
-    // 2. 매장 생성
+    // 2. DB에 저장할 매장 이름 만들기: 본사(지점)
+    const storeDisplayName =
+      invite.branch_name
+        ? `${invite.head_office_name}(${invite.branch_name})`
+        : invite.head_office_name;
+
+    // 3. 매장 생성
     const storeResult = await pool.query(
       `
       INSERT INTO stores (head_office_id, name, business_no, phone, status, created_at)
       VALUES ($1, $2, $3, $4, 'ACTIVE', NOW())
       RETURNING *;
       `,
-      [invite.head_office_id, name, businessNo || null, phone || null]
+      [invite.head_office_id, storeDisplayName, businessNo || null, phone || null]
     );
 
     console.log('[/stores/join] new store =', storeResult.rows[0]);
 
-    // 3. 사용 횟수 증가
+    // 4. 사용 횟수 증가
     await pool.query(
       `
       UPDATE head_office_invite_codes
@@ -195,11 +199,10 @@ app.post('/stores/join', async (req, res) => {
     });
   } catch (e) {
     console.error('[/stores/join] ERROR =', e);
-    return res
-      .status(500)
-      .json({ message: '가맹점 가입 중 오류', error: e.message });
+    return res.status(500).json({ message: '가맹점 가입 중 오류', error: e.message });
   }
 });
+
 
 // ------------------ 4) 가맹점 상품 목록 ------------------
 
