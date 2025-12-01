@@ -254,3 +254,22 @@ const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
+
+// DB 헬스체크용
+app.get('/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() as now');
+    res.json({
+      ok: true,
+      db: 'connected',
+      now: result.rows[0].now,
+    });
+  } catch (e) {
+    console.error('[health] DB ERROR =', e);
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
