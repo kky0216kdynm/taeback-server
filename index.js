@@ -13,7 +13,7 @@ app.use(cors());
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Cloudtype 접속 필수 설정
+  ssl: false   // ⭐ 중요: Cloudtype 내부 Postgres는 SSL ❌
 });
 
 // DB 연결 확인 로그
