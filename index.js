@@ -1,3 +1,4 @@
+// index.js (최종_진짜_완성본.js)
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
@@ -11,12 +12,11 @@ app.use(express.json());
 app.use(cors());
 
 // ----------------------------------------------------
-// 1. 데이터베이스 연결 (Cloudtype / Render 공용)
+// 1. 데이터베이스 연결 (DATABASE_URL 하나로 끝!)
 // ----------------------------------------------------
-// .env 파일이나 Cloudtype 환경변수에 DATABASE_URL이 있어야 합니다.
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // 클라우드 DB 사용 시 필수
+  connectionString: process.env.DATABASE_URL, // Cloudtype 환경변수에서 가져옴
+  ssl: { rejectUnauthorized: false } // 클라우드 DB 필수 설정
 });
 
 pool.connect()
@@ -24,22 +24,20 @@ pool.connect()
   .catch(err => console.error('❌ DB 연결 실패:', err.message));
 
 // ----------------------------------------------------
-// 2. API 엔드포인트 (새로운 2단계 인증 로직)
+// 2. API 엔드포인트
 // ----------------------------------------------------
 
-// [1단계] 본사 코드 확인 -> 지점 목록 반환
+// [1단계] 본사 코드 확인
 app.post('/auth/verify-head', async (req, res) => {
   const { inviteCode } = req.body;
-  console.log(`[본사 인증] 코드: ${inviteCode}`);
-
   try {
     // 본사 찾기
     const headRes = await pool.query('SELECT id, name FROM head_offices WHERE code = $1', [inviteCode]);
     if (headRes.rows.length === 0) return res.status(404).json({ success: false, message: '본사 코드가 틀렸습니다.' });
-
+    
     const headOffice = headRes.rows[0];
 
-    // 지점 목록 조회 (가맹점 코드는 보안상 안 보냄)
+    // 지점 목록 조회
     const branchesRes = await pool.query('SELECT id, name, address FROM stores WHERE head_office_id = $1 ORDER BY name ASC', [headOffice.id]);
 
     res.json({ success: true, headOffice, branches: branchesRes.rows });
@@ -48,13 +46,10 @@ app.post('/auth/verify-head', async (req, res) => {
   }
 });
 
-// [2단계] 가맹점 로그인 (지점ID + 가맹점 코드)
+// [2단계] 가맹점 로그인
 app.post('/auth/login-store', async (req, res) => {
   const { storeId, merchantCode } = req.body;
-  console.log(`[가맹점 로그인] ID: ${storeId}, 코드: ${merchantCode}`);
-
   try {
-    // 가맹점 코드 확인
     const resStore = await pool.query(
       'SELECT id, name, head_office_id, status FROM stores WHERE id = $1 AND merchant_code = $2',
       [storeId, merchantCode]
@@ -81,9 +76,7 @@ app.get('/products', async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// 3. 서버 실행
-// ----------------------------------------------------
+// 서버 실행
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 서버 실행 중: 포트 ${PORT}`);
