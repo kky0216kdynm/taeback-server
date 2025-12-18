@@ -71,6 +71,55 @@ app.get('/products', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+// 4. 가맹점 가입 초대 코드
+app.post('/stores/join', async (req, res) => {
+  const { inviteCode, name, businessNo, phone } = req.body;
+
+  try {
+    // ✅ UI가 보내는 inviteCode를 "가맹코드(merchant_code)"로 취급
+    const storeRes = await pool.query(
+      `SELECT
+         id,
+         head_office_id,
+         name,
+         business_no,
+         phone,
+         status,
+         created_at
+       FROM stores
+       WHERE merchant_code = $1
+       LIMIT 1`,
+      [inviteCode]
+    );
+
+    if (storeRes.rows.length === 0) {
+      return res.status(404).json({ message: '가맹점 코드가 존재하지 않습니다.' });
+    }
+
+    const store = storeRes.rows[0];
+
+    // (선택) stores.name/business_no/phone이 비어있으면 join 시점에 채워넣기
+    // UI는 name/businessNo/phone을 보내고 있으니 DB 채우고 싶으면 아래 주석 해제
+    /*
+    await pool.query(
+      `UPDATE stores
+       SET name = COALESCE(name, $2),
+           business_no = COALESCE(business_no, $3),
+           phone = COALESCE(phone, $4)
+       WHERE id = $1`,
+      [store.id, name, businessNo, phone]
+    );
+    */
+
+    return res.json({
+      store,
+      headOfficeId: store.head_office_id
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
