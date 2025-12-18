@@ -1,43 +1,39 @@
-// index.js (최종_진짜_완성본.js)
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
-const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
 
-// 미들웨어 설정
 app.use(express.json());
 app.use(cors());
 
 // ----------------------------------------------------
-// 1. 데이터베이스 연결 (DATABASE_URL 하나로 끝!)
+// ✅ 핵심: DATABASE_URL 하나로 연결하기
 // ----------------------------------------------------
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // Cloudtype 환경변수에서 가져옴
-  ssl: { rejectUnauthorized: false } // 클라우드 DB 필수 설정
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // Cloudtype 접속 필수 설정
 });
 
+// DB 연결 확인 로그
 pool.connect()
   .then(() => console.log('✅ DB 연결 성공!'))
   .catch(err => console.error('❌ DB 연결 실패:', err.message));
 
+
 // ----------------------------------------------------
-// 2. API 엔드포인트
+// API 엔드포인트
 // ----------------------------------------------------
 
-// [1단계] 본사 코드 확인
+// 1. 본사 인증
 app.post('/auth/verify-head', async (req, res) => {
   const { inviteCode } = req.body;
   try {
-    // 본사 찾기
     const headRes = await pool.query('SELECT id, name FROM head_offices WHERE code = $1', [inviteCode]);
     if (headRes.rows.length === 0) return res.status(404).json({ success: false, message: '본사 코드가 틀렸습니다.' });
     
     const headOffice = headRes.rows[0];
-
-    // 지점 목록 조회
     const branchesRes = await pool.query('SELECT id, name, address FROM stores WHERE head_office_id = $1 ORDER BY name ASC', [headOffice.id]);
 
     res.json({ success: true, headOffice, branches: branchesRes.rows });
@@ -46,7 +42,7 @@ app.post('/auth/verify-head', async (req, res) => {
   }
 });
 
-// [2단계] 가맹점 로그인
+// 2. 가맹점 로그인
 app.post('/auth/login-store', async (req, res) => {
   const { storeId, merchantCode } = req.body;
   try {
@@ -65,7 +61,7 @@ app.post('/auth/login-store', async (req, res) => {
   }
 });
 
-// [상품 조회]
+// 3. 상품 조회
 app.get('/products', async (req, res) => {
   const { headOfficeId } = req.query;
   try {
