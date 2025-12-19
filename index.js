@@ -234,17 +234,19 @@ app.get('/head/orders/:orderId', async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// ✅ 여기부터 "React 정적 파일" 서빙 (맨 아래!!!)
-// ----------------------------------------------------
-app.use(express.static(path.join(__dirname, 'admin', 'dist')));
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'admin', 'dist', 'index.html'));
-});
+
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 서버 실행 중: 포트 ${PORT}`);
+});
+// ----------------------------------------------------
+// ✅ 여기부터 "React 정적 파일" 서빙 (맨 아래!!!)
+// ----------------------------------------------------
+
+app.use(express.static(path.join(__dirname, 'admin', 'dist')));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'admin', 'dist', 'index.html'));
 });
