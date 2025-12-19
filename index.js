@@ -242,18 +242,17 @@ app.get('/head/orders/:orderId', async (req, res) => {
 const distPath = path.join(__dirname, 'admin', 'dist');
 app.use(express.static(distPath));
 
-app.get('*', (req, res) => {
-  // API 경로는 여기서 처리하지 않게 막기
-  if (
-    req.path.startsWith('/auth') ||
-    req.path.startsWith('/products') ||
-    req.path.startsWith('/orders') ||
-    req.path.startsWith('/head')
-  ) {
-    return res.status(404).send('Not Found');
-  }
+app.get(/^\/(?!auth|products|orders|head).*/, (req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
+app.get("/__whoami", (req, res) => {
+  res.json({
+    ok: true,
+    service: "taeback-api",
+    time: new Date().toISOString()
+  });
+});
+
 
 
 // 서버 실행
