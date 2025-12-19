@@ -236,21 +236,21 @@ app.get('/head/orders/:orderId', async (req, res) => {
 });
 
 
-// ----------------------------------------------------
-// React (SPA) 서빙: 맨 마지막
-// ----------------------------------------------------
-const distPath = path.join(__dirname, 'admin', 'dist');
+const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 
-app.get(/^\/(?!auth|products|orders|head).*/, (req, res) => {
-  res.sendFile(path.join(distPath, 'index.html'));
-});
+// ✅ API 테스트용은 SPA catch-all 보다 "위"에 둬야 함
 app.get("/__whoami", (req, res) => {
   res.json({
     ok: true,
     service: "taeback-api",
     time: new Date().toISOString()
   });
+});
+
+// ✅ SPA 라우팅: 맨 마지막
+app.get(/^\/(?!auth|products|orders|head|__whoami).*/, (req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
 });
 
 
