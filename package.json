@@ -2,11 +2,10 @@
   "name": "taeback-server",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build:admin": "cd admin && npm install && npm run build"
-  },
+ "scripts": {
+  "start": "node index.js",
+  "build:admin": "npm --prefix admin ci && npm --prefix admin run build"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
