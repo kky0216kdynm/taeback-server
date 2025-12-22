@@ -1,8 +1,8 @@
-require('dotenv').config();
-const express = require('express');
-const { Pool } = require('pg');
-const cors = require('cors');
-const path = require('path');
+require("dotenv").config();
+const express = require("express");
+const { Pool } = require("pg");
+const cors = require("cors");
+const path = require("path");
 
 const app = express();
 
@@ -14,38 +14,41 @@ app.use(express.json());
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false
+  ssl: false,
 });
 
+// ✅ DB 세션 타임존을 KST로 고정
 pool.on("connect", (client) => {
-  client.query(`SET TIME ZONE 'Asia/Seoul'`);
+  client.query("SET TIME ZONE 'Asia/Seoul'");
 });
 
-pool.connect()
-  .then(() => console.log('✅ DB 연결 성공!'))
-  .catch(err => console.error('❌ DB 연결 실패:', err.message));
-
+pool
+  .connect()
+  .then(() => console.log("✅ DB 연결 성공!"))
+  .catch((err) => console.error("❌ DB 연결 실패:", err.message));
 
 // ----------------------------------------------------
 // API
 // ----------------------------------------------------
 
 // 1. 본사 인증
-app.post('/auth/verify-head', async (req, res) => {
+app.post("/auth/verify-head", async (req, res) => {
   const { inviteCode } = req.body;
   try {
     const headRes = await pool.query(
-      'SELECT id, name FROM head_offices WHERE code = $1',
+      "SELECT id, name FROM head_offices WHERE code = $1",
       [inviteCode]
     );
 
     if (headRes.rows.length === 0) {
-      return res.status(404).json({ success: false, message: '본사 코드가 틀렸습니다.' });
+      return res
+        .status(404)
+        .json({ success: false, message: "본사 코드가 틀렸습니다." });
     }
 
     const headOffice = headRes.rows[0];
     const branchesRes = await pool.query(
-      'SELECT id, name, address FROM stores WHERE head_office_id = $1 ORDER BY name ASC',
+      "SELECT id, name, address FROM stores WHERE head_office_id = $1 ORDER BY name ASC",
       [headOffice.id]
     );
 
@@ -56,18 +59,20 @@ app.post('/auth/verify-head', async (req, res) => {
 });
 
 // 2. 가맹점 로그인(지점id+가맹코드)
-app.post('/auth/login-store', async (req, res) => {
+app.post("/auth/login-store", async (req, res) => {
   const { storeId, merchantCode } = req.body;
   try {
     const resStore = await pool.query(
-      'SELECT id, name, head_office_id, status FROM stores WHERE id = $1 AND merchant_code = $2',
+      "SELECT id, name, head_office_id, status FROM stores WHERE id = $1 AND merchant_code = $2",
       [storeId, merchantCode]
     );
 
     if (resStore.rows.length > 0) {
-      res.json({ success: true, message: '로그인 성공', store: resStore.rows[0] });
+      res.json({ success: true, message: "로그인 성공", store: resStore.rows[0] });
     } else {
-      res.status(401).json({ success: false, message: '가맹점 코드가 일치하지 않습니다.' });
+      res
+        .status(401)
+        .json({ success: false, message: "가맹점 코드가 일치하지 않습니다." });
     }
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -75,11 +80,11 @@ app.post('/auth/login-store', async (req, res) => {
 });
 
 // 3. 상품 조회
-app.get('/products', async (req, res) => {
+app.get("/products", async (req, res) => {
   const { headOfficeId } = req.query;
   try {
     const result = await pool.query(
-      'SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC',
+      "SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC",
       [headOfficeId]
     );
     res.json({ success: true, products: result.rows });
@@ -89,12 +94,13 @@ app.get('/products', async (req, res) => {
 });
 
 // 4. 가맹점 코드만으로 로그인
-app.post('/auth/login-store-by-code', async (req, res) => {
+app.post("/auth/login-store-by-code", async (req, res) => {
   const { merchantCode } = req.body;
 
   try {
     const result = await pool.query(
-      `SELECT id, head_office_id, name, business_no, phone, status, created_at
+      `SELECT id, head_office_id, name, business_no, phone, status,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
        FROM stores
        WHERE merchant_code = $1
        LIMIT 1`,
@@ -102,38 +108,40 @@ app.post('/auth/login-store-by-code', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, message: '가맹점 코드가 일치하지 않습니다.' });
+      return res
+        .status(401)
+        .json({ success: false, message: "가맹점 코드가 일치하지 않습니다." });
     }
 
-    return res.json({ success: true, message: '로그인 성공', store: result.rows[0] });
+    return res.json({ success: true, message: "로그인 성공", store: result.rows[0] });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // 5. 주문 생성
-app.post('/orders', async (req, res) => {
+app.post("/orders", async (req, res) => {
   const { storeId, items } = req.body;
 
   if (!storeId || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ success: false, message: 'storeId/items 필요' });
+    return res.status(400).json({ success: false, message: "storeId/items 필요" });
   }
 
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
     const storeRes = await client.query(
-      'SELECT id, head_office_id FROM stores WHERE id = $1',
+      "SELECT id, head_office_id FROM stores WHERE id = $1",
       [storeId]
     );
     if (storeRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'store 없음' });
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "store 없음" });
     }
     const headOfficeId = storeRes.rows[0].head_office_id;
 
-    const productIds = items.map(i => i.productId);
+    const productIds = items.map((i) => i.productId);
     const productsRes = await client.query(
       `SELECT id, price
        FROM products
@@ -142,14 +150,16 @@ app.post('/orders', async (req, res) => {
       [productIds, headOfficeId]
     );
 
-    const priceMap = new Map(productsRes.rows.map(p => [p.id, p.price]));
+    const priceMap = new Map(productsRes.rows.map((p) => [p.id, p.price]));
 
     let total = 0;
     for (const it of items) {
       const price = priceMap.get(it.productId);
       if (price == null) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: `상품 불일치: ${it.productId}` });
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ success: false, message: `상품 불일치: ${it.productId}` });
       }
       total += price * it.qty;
     }
@@ -172,10 +182,10 @@ app.post('/orders', async (req, res) => {
       );
     }
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
     return res.json({ success: true, orderId });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     return res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -183,20 +193,26 @@ app.post('/orders', async (req, res) => {
 });
 
 // 6. 본사: 주문목록
-app.get('/head/orders', async (req, res) => {
+app.get("/head/orders", async (req, res) => {
   const { headOfficeId, status } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success:false, message:'headOfficeId 필요' });
+  if (!headOfficeId)
+    return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
     const params = [headOfficeId];
-    let where = 'WHERE o.head_office_id = $1';
+    let where = "WHERE o.head_office_id = $1";
     if (status) {
       params.push(status);
       where += ` AND o.status = $2`;
     }
 
     const result = await pool.query(
-      `SELECT o.id, o.store_id, s.name AS store_name, o.status, o.total_amount, o.created_at
+      `SELECT o.id,
+              o.store_id,
+              s.name AS store_name,
+              o.status,
+              o.total_amount,
+              to_char(o.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
        FROM orders o
        JOIN stores s ON s.id = o.store_id
        ${where}
@@ -204,25 +220,32 @@ app.get('/head/orders', async (req, res) => {
       params
     );
 
-    res.json({ success:true, orders: result.rows });
+    res.json({ success: true, orders: result.rows });
   } catch (err) {
-    res.status(500).json({ success:false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // 7. 본사: 주문 상세
-app.get('/head/orders/:orderId', async (req, res) => {
+app.get("/head/orders/:orderId", async (req, res) => {
   const { orderId } = req.params;
 
   try {
     const head = await pool.query(
-      `SELECT o.id, o.store_id, s.name AS store_name, o.head_office_id, o.status, o.total_amount, o.created_at
+      `SELECT o.id,
+              o.store_id,
+              s.name AS store_name,
+              o.head_office_id,
+              o.status,
+              o.total_amount,
+              to_char(o.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
        FROM orders o
        JOIN stores s ON s.id = o.store_id
        WHERE o.id = $1`,
       [orderId]
     );
-    if (head.rows.length === 0) return res.status(404).json({ success:false, message:'order 없음' });
+    if (head.rows.length === 0)
+      return res.status(404).json({ success: false, message: "order 없음" });
 
     const items = await pool.query(
       `SELECT oi.product_id, p.name, oi.qty, oi.unit_price, oi.line_total
@@ -233,14 +256,16 @@ app.get('/head/orders/:orderId', async (req, res) => {
       [orderId]
     );
 
-    res.json({ success:true, order: head.rows[0], items: items.rows });
+    res.json({ success: true, order: head.rows[0], items: items.rows });
   } catch (err) {
-    res.status(500).json({ success:false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-
-const distPath = path.join(__dirname, 'dist');
+// ----------------------------------------------------
+// Static + SPA
+// ----------------------------------------------------
+const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 
 // ✅ API 테스트용은 SPA catch-all 보다 "위"에 둬야 함
@@ -248,16 +273,14 @@ app.get("/__whoami", (req, res) => {
   res.json({
     ok: true,
     service: "taeback-api",
-    time: new Date().toISOString()
+    time: new Date().toISOString(),
   });
 });
 
 // ✅ SPA 라우팅: 맨 마지막
 app.get(/^\/(?!auth|products|orders|head|__whoami).*/, (req, res) => {
-  res.sendFile(path.join(distPath, 'index.html'));
+  res.sendFile(path.join(distPath, "index.html"));
 });
-
-
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
