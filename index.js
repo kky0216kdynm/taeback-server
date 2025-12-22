@@ -17,6 +17,10 @@ const pool = new Pool({
   ssl: false
 });
 
+pool.on("connect", (client) => {
+  client.query(`SET TIME ZONE 'Asia/Seoul'`);
+});
+
 pool.connect()
   .then(() => console.log('✅ DB 연결 성공!'))
   .catch(err => console.error('❌ DB 연결 실패:', err.message));
