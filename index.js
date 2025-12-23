@@ -30,6 +30,21 @@ pool
 // ----------------------------------------------------
 // API
 // ----------------------------------------------------
+//포인트 입금 관련
+const DEPOSIT = {
+  bank: process.env.DEPOSIT_BANK_NAME || "은행명",
+  account: process.env.DEPOSIT_ACCOUNT_NO || "계좌번호",
+  holder: process.env.DEPOSIT_ACCOUNT_HOLDER || "예금주",
+};
+
+const MASTER_API_KEY = process.env.MASTER_API_KEY || "";
+function requireMaster(req, res, next) {
+  const key = req.header("x-master-key");
+  if (!MASTER_API_KEY || key !== MASTER_API_KEY) {
+    return res.status(401).json({ success: false, message: "MASTER 인증 실패" });
+  }
+  next();
+}
 
 // 1. 본사 인증
 app.post("/auth/verify-head", async (req, res) => {
@@ -261,6 +276,162 @@ app.get("/head/orders/:orderId", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+// 8. 가맹점: 지갑(잔액) 조회
+app.get("/wallet", async (req, res) => {
+  const storeId = Number(req.query.storeId);
+  if (!storeId) return res.status(400).json({ success: false, message: "storeId 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT store_id, balance, to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+       FROM store_wallets
+       WHERE store_id = $1`,
+      [storeId]
+    );
+
+    if (r.rows.length === 0) {
+      return res.json({ success: true, wallet: { store_id: storeId, balance: 0 } });
+    }
+    return res.json({ success: true, wallet: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 9. 가맹점: 포인트 충전 요청 생성
+app.post("/topups/request", async (req, res) => {
+  const { storeId, amount, depositorName } = req.body;
+
+  const sid = Number(storeId);
+  const amt = Number(amount);
+
+  if (!sid || !amt || amt <= 0) {
+    return res.status(400).json({ success: false, message: "storeId/amount 필요(0보다 커야 함)" });
+  }
+
+  try {
+    // store 존재 확인 (원하면 status ACTIVE 체크도 가능)
+    const s = await pool.query("SELECT id, merchant_code, name FROM stores WHERE id=$1", [sid]);
+    if (s.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "store 없음" });
+    }
+
+    const merchantCode = s.rows[0].merchant_code;
+
+    const r = await pool.query(
+      `INSERT INTO point_topups (store_id, amount, depositor_name, status)
+       VALUES ($1, $2, $3, 'requested')
+       RETURNING id, store_id, amount, status, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at`,
+      [sid, amt, depositorName || null]
+    );
+
+    // 가맹점이 은행앱에서 이체할 때 헷갈리지 않게 “입금자명 규칙”을 내려줌
+    // 예: TBK-A1B2C (가맹점 merchant_code)
+    const depositGuide = {
+      bank: DEPOSIT.bank,
+      account: DEPOSIT.account,
+      holder: DEPOSIT.holder,
+      memoRule: `입금자명(권장): ${merchantCode}`, // 운영규칙: 입금자명에 merchantCode 넣게 유도
+      topupId: r.rows[0].id,
+    };
+
+    return res.json({ success: true, topup: r.rows[0], depositGuide });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 10. 가맹점: 내 충전 요청 목록
+app.get("/topups", async (req, res) => {
+  const storeId = Number(req.query.storeId);
+  if (!storeId) return res.status(400).json({ success: false, message: "storeId 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, store_id, amount, status,
+              depositor_name,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+              to_char(paid_at, 'YYYY-MM-DD HH24:MI:SS') AS paid_at
+       FROM point_topups
+       WHERE store_id = $1
+       ORDER BY id DESC
+       LIMIT 50`,
+      [storeId]
+    );
+    return res.json({ success: true, topups: r.rows });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 11. 마스터: 충전 승인(입금 확인 후)  ★핵심★
+app.post("/admin/topups/:id/mark-paid", requireMaster, async (req, res) => {
+  const topupId = Number(req.params.id);
+  if (!topupId) return res.status(400).json({ success: false, message: "topupId 필요" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 중복 승인 방지: row 잠금
+    const t = await client.query(
+      "SELECT id, store_id, amount, status FROM point_topups WHERE id=$1 FOR UPDATE",
+      [topupId]
+    );
+    if (t.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "topup 없음" });
+    }
+
+    const topup = t.rows[0];
+    if (topup.status === "paid") {
+      await client.query("ROLLBACK");
+      return res.json({ success: true, message: "이미 승인된 topup", topupId });
+    }
+    if (topup.status !== "requested") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: `처리 불가 상태: ${topup.status}` });
+    }
+
+    // 1) topup 상태 변경
+    await client.query(
+      "UPDATE point_topups SET status='paid', paid_at=now() WHERE id=$1",
+      [topupId]
+    );
+
+    // 2) 지갑 upsert(+amount)
+    await client.query(
+      `INSERT INTO store_wallets(store_id, balance)
+       VALUES($1, $2)
+       ON CONFLICT(store_id)
+       DO UPDATE SET balance = store_wallets.balance + EXCLUDED.balance, updated_at=now()`,
+      [topup.store_id, topup.amount]
+    );
+
+    // 3) 원장 기록
+    await client.query(
+      `INSERT INTO point_ledger(store_id, type, amount, ref_type, ref_id, memo)
+       VALUES($1, 'CHARGE', $2, 'TOPUP', $3, '관리자 입금확인 충전')`,
+      [topup.store_id, topup.amount, topupId]
+    );
+
+    await client.query("COMMIT");
+
+    // 승인 후 잔액 리턴(프론트 편하게)
+    const w = await pool.query(
+      "SELECT store_id, balance FROM store_wallets WHERE store_id=$1",
+      [topup.store_id]
+    );
+
+    return res.json({ success: true, topupId, storeId: topup.store_id, wallet: w.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    return res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ----------------------------------------------------
 // Static + SPA
