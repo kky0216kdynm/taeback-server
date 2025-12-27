@@ -3,6 +3,11 @@ const express = require("express");
 const { Pool } = require("pg");
 const cors = require("cors");
 const path = require("path");
+const crypto = require("crypto");
+
+const multer = require("multer");
+const xlsx = require("xlsx");
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 app.use(cors());
@@ -13,7 +18,7 @@ app.use(express.json());
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false,
+  ssl: false, // 운영에서 SSL 필요하면 { rejectUnauthorized:false } 로 변경 고려
 });
 
 // ✅ DB 세션 타임존을 KST로 고정
@@ -60,27 +65,6 @@ function extractDepositCode(text) {
   return { headOfficeId: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
 }
 
-const multer = require("multer");
-const xlsx = require("xlsx");
-const upload = multer({ storage: multer.memoryStorage() });
-
-function generateAuthCode(len = 8) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let code = "";
-  for (let i = 0; i < len; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-
-async function generateUniqueAuthCode() {
-  for (let i = 0; i < 20; i++) {
-    const code = generateAuthCode(8);
-    const exists = await pool.query("SELECT 1 FROM stores WHERE auth_code=$1", [code]);
-    if (exists.rowCount === 0) return code;
-  }
-  // 혹시 몰라서 최후 fallback
-  return generateAuthCode(10);
-}
-
 function readExcel(buffer) {
   const wb = xlsx.read(buffer, { type: "buffer" });
   const sheetName = wb.SheetNames[0];
@@ -97,6 +81,34 @@ function normalizeStatus(v, fallback = "ACTIVE") {
   return fallback;
 }
 
+// ✅ 보안 고려: 12자리 영문+숫자 랜덤 (혼동문자 제거)
+function generateSecureCode12() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // I,O,0,1 제거
+  const bytes = crypto.randomBytes(12);
+  let out = "";
+  for (let i = 0; i < 12; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
+
+// ✅ stores.auth_code 유니크 보장 생성
+async function generateUniqueStoreAuthCode() {
+  for (let i = 0; i < 50; i++) {
+    const code = generateSecureCode12();
+    const exists = await pool.query("SELECT 1 FROM stores WHERE auth_code=$1", [code]);
+    if (exists.rowCount === 0) return code;
+  }
+  return generateSecureCode12();
+}
+
+// ✅ head_offices.code 유니크 보장 생성
+async function generateUniqueHeadOfficeCode() {
+  for (let i = 0; i < 50; i++) {
+    const code = generateSecureCode12();
+    const exists = await pool.query("SELECT 1 FROM head_offices WHERE code=$1", [code]);
+    if (exists.rowCount === 0) return code;
+  }
+  return generateSecureCode12();
+}
 
 // ----------------------------------------------------
 // Core: TOPUP 승인 처리(공통 함수)
@@ -223,8 +235,31 @@ app.post("/auth/login-store-by-code", async (req, res) => {
   }
 });
 
+// 4) 가맹점 인증코드(auth_code) 로그인
+app.post("/auth/login-store-by-authcode", async (req, res) => {
+  const { authCode } = req.body;
+  if (!authCode) return res.status(400).json({ success: false, message: "authCode 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, head_office_id, name, status, auth_code
+       FROM stores
+       WHERE auth_code=$1
+       LIMIT 1`,
+      [String(authCode).trim().toUpperCase()]
+    );
+
+    if (r.rowCount === 0) return res.status(401).json({ success: false, message: "인증코드가 일치하지 않습니다." });
+    if (r.rows[0].status !== "ACTIVE") return res.status(403).json({ success: false, message: "비활성 가맹점입니다." });
+
+    res.json({ success: true, message: "로그인 성공", store: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ----------------------------------------------------
-// PRODUCTS
+// PRODUCTS (가맹점/본사 웹에서 사용)
 // ----------------------------------------------------
 app.get("/products", async (req, res) => {
   const { headOfficeId } = req.query;
@@ -413,7 +448,6 @@ app.get("/head/orders/:orderId", async (req, res) => {
 // ----------------------------------------------------
 // WALLET / TOPUP / LEDGER
 // ----------------------------------------------------
-// 지갑 조회
 app.get("/wallet", async (req, res) => {
   const storeId = Number(req.query.storeId);
   if (!storeId) return res.status(400).json({ success: false, message: "storeId 필요" });
@@ -450,11 +484,7 @@ app.post("/topups/request", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // store에서 head_office_id 같이 가져오기
-    const s = await client.query(
-      "SELECT id, head_office_id, merchant_code FROM stores WHERE id=$1",
-      [sid]
-    );
+    const s = await client.query("SELECT id, head_office_id, merchant_code FROM stores WHERE id=$1", [sid]);
     if (s.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "store 없음" });
@@ -462,11 +492,9 @@ app.post("/topups/request", async (req, res) => {
     const headOfficeId = Number(s.rows[0].head_office_id);
     const merchantCode = s.rows[0].merchant_code;
 
-    // 프로필의 입금자명 기본값
     const prof = await client.query("SELECT depositor_name FROM store_profiles WHERE store_id=$1", [sid]);
     const depositor = depositorName || (prof.rows[0]?.depositor_name ?? null);
 
-    // 1) topup row 생성
     const r = await client.query(
       `INSERT INTO point_topups (store_id, amount, depositor_name, status)
        VALUES ($1, $2, $3, 'requested')
@@ -477,12 +505,8 @@ app.post("/topups/request", async (req, res) => {
 
     const topupId = Number(r.rows[0].id);
 
-    // 2) deposit_code 생성/저장
     const depositCode = makeDepositCode(headOfficeId, sid, topupId);
-    await client.query(
-      "UPDATE point_topups SET deposit_code=$1 WHERE id=$2",
-      [depositCode, topupId]
-    );
+    await client.query("UPDATE point_topups SET deposit_code=$1 WHERE id=$2", [depositCode, topupId]);
 
     await client.query("COMMIT");
 
@@ -490,11 +514,7 @@ app.post("/topups/request", async (req, res) => {
       bank: DEPOSIT.bank,
       account: DEPOSIT.account,
       holder: DEPOSIT.holder,
-
-      // ✅ 핵심: 이거를 “받는통장표시(메모)”에 붙여넣게 할 것
       depositCode,
-
-      // 운영 가이드(선택)
       memoRule: `받는통장표시(메모)에 ${depositCode} 입력`,
       depositorRule: `입금자명(권장): ${merchantCode}`,
     };
@@ -508,7 +528,6 @@ app.post("/topups/request", async (req, res) => {
   }
 });
 
-// 충전 요청 목록
 app.get("/topups", async (req, res) => {
   const storeId = Number(req.query.storeId);
   if (!storeId) return res.status(400).json({ success: false, message: "storeId 필요" });
@@ -547,7 +566,6 @@ app.post("/admin/topups/:id/mark-paid", requireMaster, async (req, res) => {
   return res.json({ success: true, ...result });
 });
 
-// 포인트 원장 내역
 app.get("/points/history", async (req, res) => {
   const storeId = Number(req.query.storeId);
   const limit = Number(req.query.limit || 50);
@@ -633,27 +651,21 @@ app.post("/profile/upsert", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// ✅ 테스트/운영용: "은행 입금 감지"를 대신하는 MOCK API
-// - 나중에 KB API 연동하면 이 부분을 "입금내역 폴링"으로 교체
+// ✅ MOCK BANK (운영 전 테스트용)
 // ----------------------------------------------------
 app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
-  // txId는 중복방지 키. 운영에선 은행거래 고유값을 쓰고,
-  // 없으면 서버에서 해시 만들어도 됨.
   const { txId, amount, memo, depositor, occurredAt } = req.body;
   if (!txId || !amount) {
     return res.status(400).json({ success: false, message: "txId/amount 필요" });
   }
 
-  // 1) 중복 처리 체크
   const dup = await pool.query("SELECT 1 FROM bank_incoming_processed WHERE tx_id=$1", [txId]);
   if (dup.rows.length) {
     return res.json({ success: true, message: "이미 처리된 tx", txId });
   }
 
-  // 2) memo에서 depositCode 추출
   const parsed = extractDepositCode(memo);
   if (!parsed) {
-    // 매칭 실패: 일단 기록만
     await pool.query(
       `INSERT INTO bank_incoming_processed(tx_id, amount, depositor, memo, occurred_at)
        VALUES($1,$2,$3,$4,$5)`,
@@ -664,7 +676,6 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
 
   const depositCode = `${parsed.headOfficeId}-${parsed.storeId}-${parsed.topupId}`;
 
-  // 3) deposit_code로 topup 찾기
   const t = await pool.query(
     `SELECT id, store_id
      FROM point_topups
@@ -684,14 +695,12 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
   const topupId = Number(t.rows[0].id);
   const storeId = Number(t.rows[0].store_id);
 
-  // 4) bank_incoming_processed 먼저 기록(중복방지)
   await pool.query(
     `INSERT INTO bank_incoming_processed(tx_id, amount, depositor, memo, occurred_at, matched_topup_id, matched_store_id)
      VALUES($1,$2,$3,$4,$5,$6,$7)`,
     [txId, Number(amount), depositor || null, memo || null, occurredAt || null, topupId, storeId]
   );
 
-  // 5) topup paid 처리
   const result = await applyTopupPaid({
     topupId,
     memo: "KB 자동입금 확인 충전",
@@ -704,46 +713,93 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Static + SPA (항상 맨 아래)
+// MASTER APIs (통합관리 시스템용)
 // ----------------------------------------------------
-const distPath = path.join(__dirname, "dist");
-app.use(express.static(distPath));
 
-app.get("/__whoami", (req, res) => {
-  res.json({
-    ok: true,
-    service: "taeback-api",
-    time: new Date().toISOString(),
-  });
-});
-
-// SPA 라우팅 (API 경로 제외)
-app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|__whoami).*/, (req, res) => {
-  res.sendFile(path.join(distPath, "index.html"));
-});
-
-// 서버 실행
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT}`));
-
-// 본사 목록
+// ✅ 본사 목록 (+ 가맹점 수 포함)
 app.get("/master/head-offices", requireMaster, async (req, res) => {
   try {
-    const r = await pool.query("SELECT * FROM head_offices ORDER BY id DESC");
+    const r = await pool.query(`
+      SELECT
+        ho.id, ho.name, ho.code, ho.manager_name, ho.address, ho.phone,
+        COUNT(s.id)::int AS store_count
+      FROM head_offices ho
+      LEFT JOIN stores s ON s.head_office_id = ho.id
+      GROUP BY ho.id
+      ORDER BY ho.id DESC
+    `);
     res.json({ success: true, headOffices: r.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-//가맹점 목록 본사별
+// ✅ 본사 추가 (본사코드 12자리 랜덤 자동 생성)
+app.post("/master/head-offices", requireMaster, async (req, res) => {
+  const { name, manager_name, address, phone } = req.body;
+  if (!name) return res.status(400).json({ success: false, message: "name 필요" });
+
+  try {
+    const code = await generateUniqueHeadOfficeCode();
+    const r = await pool.query(
+      `INSERT INTO head_offices (name, code, manager_name, address, phone)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, code, manager_name, address, phone`,
+      [name, code, manager_name ?? null, address ?? null, phone ?? null]
+    );
+    return res.status(201).json({ success: true, headOffice: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 본사 수정
+app.patch("/master/head-offices/:id", requireMaster, async (req, res) => {
+  const id = Number(req.params.id);
+  const { name, manager_name, address, phone } = req.body;
+
+  try {
+    const r = await pool.query(
+      `UPDATE head_offices
+       SET name = COALESCE($2, name),
+           manager_name = COALESCE($3, manager_name),
+           address = COALESCE($4, address),
+           phone = COALESCE($5, phone)
+       WHERE id = $1
+       RETURNING id, name, code, manager_name, address, phone`,
+      [id, name ?? null, manager_name ?? null, address ?? null, phone ?? null]
+    );
+    if (!r.rowCount) return res.status(404).json({ success: false, message: "본사 없음" });
+    res.json({ success: true, headOffice: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 본사 삭제
+app.delete("/master/head-offices/:id", requireMaster, async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const r = await pool.query(`DELETE FROM head_offices WHERE id=$1`, [id]);
+    if (!r.rowCount) return res.status(404).json({ success: false, message: "본사 없음" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 가맹점 목록 (본사별)
 app.get("/master/stores", requireMaster, async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
     const r = await pool.query(
-      "SELECT id, head_office_id, name, address, phone, status, merchant_code, auth_code, created_at FROM stores WHERE head_office_id=$1 ORDER BY id DESC",
+      `SELECT id, head_office_id, name, address, phone, status, merchant_code, auth_code,
+              to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
+       FROM stores
+       WHERE head_office_id=$1
+       ORDER BY id DESC`,
       [headOfficeId]
     );
     res.json({ success: true, stores: r.rows });
@@ -752,13 +808,13 @@ app.get("/master/stores", requireMaster, async (req, res) => {
   }
 });
 
-//가맹점 단건 추가
+// ✅ 가맹점 단건 추가 (auth_code 자동 생성)
 app.post("/master/stores", requireMaster, async (req, res) => {
   const { headOfficeId, name, address, phone, status } = req.body;
   if (!headOfficeId || !name) return res.status(400).json({ success: false, message: "headOfficeId/name 필요" });
 
   try {
-    const authCode = await generateUniqueAuthCode();
+    const authCode = await generateUniqueStoreAuthCode();
     const r = await pool.query(
       `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
        VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
@@ -770,7 +826,7 @@ app.post("/master/stores", requireMaster, async (req, res) => {
   }
 });
 
-//가맹점 엑셀 업로드
+// ✅ 가맹점 엑셀 업로드 (본사코드 기준으로 매핑, auth_code 자동 생성)
 app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
 
@@ -791,7 +847,7 @@ app.post("/master/stores/upload", requireMaster, upload.single("file"), async (r
       const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
       if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
 
-      const authCode = await generateUniqueAuthCode();
+      const authCode = await generateUniqueStoreAuthCode();
 
       await pool.query(
         `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
@@ -801,21 +857,25 @@ app.post("/master/stores/upload", requireMaster, upload.single("file"), async (r
 
       result.inserted++;
     } catch (e) {
-      result.failed.push({ rowIndex: i + 2, error: e.message }); // 2 = 헤더
+      result.failed.push({ rowIndex: i + 2, error: e.message });
     }
   }
 
   res.json({ success: true, ...result });
 });
 
-//상품 목록 (본사 선택 후)
+// ✅ 상품 목록 (본사 선택 후)
 app.get("/master/products", requireMaster, async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
     const r = await pool.query(
-      "SELECT id, head_office_id, name, category, price, unit, image_url, status, created_at FROM products WHERE head_office_id=$1 ORDER BY id DESC",
+      `SELECT id, head_office_id, name, category, price, unit, image_url, status,
+              to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
+       FROM products
+       WHERE head_office_id=$1
+       ORDER BY id DESC`,
       [headOfficeId]
     );
     res.json({ success: true, products: r.rows });
@@ -824,22 +884,22 @@ app.get("/master/products", requireMaster, async (req, res) => {
   }
 });
 
-//상품 품절 토글
+// ✅ 상품 품절 토글 (재고 없이 status만: ACTIVE / SOLD_OUT)
 app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body; // ACTIVE / SOLD_OUT
+  const { status } = req.body;
   try {
-    const r = await pool.query(
-      "UPDATE products SET status=$1 WHERE id=$2 RETURNING *",
-      [normalizeStatus(status, "ACTIVE"), id]
-    );
+    const r = await pool.query("UPDATE products SET status=$1 WHERE id=$2 RETURNING *", [
+      normalizeStatus(status, "ACTIVE"),
+      id,
+    ]);
     res.json({ success: true, product: r.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-//상품 엑셀 업로드
+// ✅ 상품 엑셀 업로드 (본사코드 기준)
 app.post("/master/products/upload", requireMaster, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
 
@@ -876,25 +936,28 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
   res.json({ success: true, ...result });
 });
 
-//가맹점 인증코드 로그인 API
-app.post("/auth/login-store-by-authcode", async (req, res) => {
-  const { authCode } = req.body;
-  if (!authCode) return res.status(400).json({ success: false, message: "authCode 필요" });
-
-  try {
-    const r = await pool.query(
-      `SELECT id, head_office_id, name, status, auth_code
-       FROM stores
-       WHERE auth_code=$1
-       LIMIT 1`,
-      [String(authCode).trim().toUpperCase()]
-    );
-
-    if (r.rowCount === 0) return res.status(401).json({ success: false, message: "인증코드가 일치하지 않습니다." });
-    if (r.rows[0].status !== "ACTIVE") return res.status(403).json({ success: false, message: "비활성 가맹점입니다." });
-
-    res.json({ success: true, message: "로그인 성공", store: r.rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+// ----------------------------------------------------
+// Health Check
+// ----------------------------------------------------
+app.get("/__whoami", (req, res) => {
+  res.json({
+    ok: true,
+    service: "taeback-api",
+    time: new Date().toISOString(),
+  });
 });
+
+// ----------------------------------------------------
+// Static + SPA (✅ 반드시 맨 아래)
+// ----------------------------------------------------
+const distPath = path.join(__dirname, "dist");
+app.use(express.static(distPath));
+
+// SPA 라우팅 (API 경로 제외) ✅ master도 제외해야 함
+app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
+});
+
+// 서버 실행 (✅ 맨 마지막)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT}`));
