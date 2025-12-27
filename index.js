@@ -60,6 +60,44 @@ function extractDepositCode(text) {
   return { headOfficeId: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
 }
 
+const multer = require("multer");
+const xlsx = require("xlsx");
+const upload = multer({ storage: multer.memoryStorage() });
+
+function generateAuthCode(len = 8) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let code = "";
+  for (let i = 0; i < len; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+async function generateUniqueAuthCode() {
+  for (let i = 0; i < 20; i++) {
+    const code = generateAuthCode(8);
+    const exists = await pool.query("SELECT 1 FROM stores WHERE auth_code=$1", [code]);
+    if (exists.rowCount === 0) return code;
+  }
+  // 혹시 몰라서 최후 fallback
+  return generateAuthCode(10);
+}
+
+function readExcel(buffer) {
+  const wb = xlsx.read(buffer, { type: "buffer" });
+  const sheetName = wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  return xlsx.utils.sheet_to_json(sheet, { defval: "" });
+}
+
+function normalizeStatus(v, fallback = "ACTIVE") {
+  const s = String(v || "").trim().toUpperCase();
+  if (s === "ACTIVE" || s === "SOLD_OUT" || s === "INACTIVE") return s;
+  if (s === "품절") return "SOLD_OUT";
+  if (s === "판매중") return "ACTIVE";
+  if (s === "비활성") return "INACTIVE";
+  return fallback;
+}
+
+
 // ----------------------------------------------------
 // Core: TOPUP 승인 처리(공통 함수)
 // - 관리자 승인 / 은행 자동확인 모두 여기 사용
@@ -687,3 +725,176 @@ app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|__wh
 // 서버 실행
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT}`));
+
+// 본사 목록
+app.get("/master/head-offices", requireMaster, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM head_offices ORDER BY id DESC");
+    res.json({ success: true, headOffices: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+//가맹점 목록 본사별
+app.get("/master/stores", requireMaster, async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+
+  try {
+    const r = await pool.query(
+      "SELECT id, head_office_id, name, address, phone, status, merchant_code, auth_code, created_at FROM stores WHERE head_office_id=$1 ORDER BY id DESC",
+      [headOfficeId]
+    );
+    res.json({ success: true, stores: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+//가맹점 단건 추가
+app.post("/master/stores", requireMaster, async (req, res) => {
+  const { headOfficeId, name, address, phone, status } = req.body;
+  if (!headOfficeId || !name) return res.status(400).json({ success: false, message: "headOfficeId/name 필요" });
+
+  try {
+    const authCode = await generateUniqueAuthCode();
+    const r = await pool.query(
+      `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [headOfficeId, name, address || null, phone || null, status || "ACTIVE", authCode]
+    );
+    res.json({ success: true, store: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+//가맹점 엑셀 업로드
+app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
+
+  const rows = readExcel(req.file.buffer);
+  const result = { inserted: 0, failed: [] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      const headOfficeCode = String(row.head_office_code || row.본사코드 || "").trim();
+      const storeName = String(row.store_name || row.가맹점명 || "").trim();
+      const address = String(row.address || row.주소 || "").trim() || null;
+      const phone = String(row.phone || row.연락처 || "").trim() || null;
+      const status = normalizeStatus(row.status || row.상태 || "ACTIVE", "ACTIVE");
+
+      if (!headOfficeCode || !storeName) throw new Error("head_office_code/store_name 필수");
+
+      const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
+      if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
+
+      const authCode = await generateUniqueAuthCode();
+
+      await pool.query(
+        `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [h.rows[0].id, storeName, address, phone, status, authCode]
+      );
+
+      result.inserted++;
+    } catch (e) {
+      result.failed.push({ rowIndex: i + 2, error: e.message }); // 2 = 헤더
+    }
+  }
+
+  res.json({ success: true, ...result });
+});
+
+//상품 목록 (본사 선택 후)
+app.get("/master/products", requireMaster, async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+
+  try {
+    const r = await pool.query(
+      "SELECT id, head_office_id, name, category, price, unit, image_url, status, created_at FROM products WHERE head_office_id=$1 ORDER BY id DESC",
+      [headOfficeId]
+    );
+    res.json({ success: true, products: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+//상품 품절 토글
+app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // ACTIVE / SOLD_OUT
+  try {
+    const r = await pool.query(
+      "UPDATE products SET status=$1 WHERE id=$2 RETURNING *",
+      [normalizeStatus(status, "ACTIVE"), id]
+    );
+    res.json({ success: true, product: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+//상품 엑셀 업로드
+app.post("/master/products/upload", requireMaster, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
+
+  const rows = readExcel(req.file.buffer);
+  const result = { inserted: 0, failed: [] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      const headOfficeCode = String(row.head_office_code || row.본사코드 || "").trim();
+      const name = String(row.name || row.상품명 || "").trim();
+      const category = String(row.category || row.카테고리 || "").trim() || null;
+      const price = Number(row.price || row.가격);
+      const unit = String(row.unit || row.단위 || "").trim() || null;
+      const status = normalizeStatus(row.status || row.상태 || "ACTIVE", "ACTIVE");
+
+      if (!headOfficeCode || !name || Number.isNaN(price)) throw new Error("head_office_code/name/price 필수");
+
+      const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
+      if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
+
+      await pool.query(
+        `INSERT INTO products(head_office_id, name, category, price, unit, status)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [h.rows[0].id, name, category, price, unit, status]
+      );
+
+      result.inserted++;
+    } catch (e) {
+      result.failed.push({ rowIndex: i + 2, error: e.message });
+    }
+  }
+
+  res.json({ success: true, ...result });
+});
+
+//가맹점 인증코드 로그인 API
+app.post("/auth/login-store-by-authcode", async (req, res) => {
+  const { authCode } = req.body;
+  if (!authCode) return res.status(400).json({ success: false, message: "authCode 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, head_office_id, name, status, auth_code
+       FROM stores
+       WHERE auth_code=$1
+       LIMIT 1`,
+      [String(authCode).trim().toUpperCase()]
+    );
+
+    if (r.rowCount === 0) return res.status(401).json({ success: false, message: "인증코드가 일치하지 않습니다." });
+    if (r.rows[0].status !== "ACTIVE") return res.status(403).json({ success: false, message: "비활성 가맹점입니다." });
+
+    res.json({ success: true, message: "로그인 성공", store: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});

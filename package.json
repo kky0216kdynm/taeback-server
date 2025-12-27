@@ -2,18 +2,19 @@
   "name": "taeback-server",
   "version": "1.0.0",
   "main": "index.js",
- "scripts": {
-  "start": "node index.js"
- 
-},
+  "scripts": {
+    "start": "node index.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "multer": "^2.0.2",
     "pg": "^8.16.3",
-    "cors": "^2.8.5"
+    "xlsx": "^0.18.5"
   }
 }
