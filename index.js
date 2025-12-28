@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 const express = require("express");
 const { Pool } = require("pg");
@@ -18,7 +19,7 @@ app.use(express.json());
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false, // 운영에서 SSL 필요하면 { rejectUnauthorized:false } 로 변경 고려
+  ssl: false, // 운영에서 SSL 필요하면 { rejectUnauthorized:false } 고려
 });
 
 // ✅ DB 세션 타임존을 KST로 고정
@@ -57,7 +58,6 @@ function makeDepositCode(headOfficeId, storeId, topupId) {
   return `${headOfficeId}-${storeId}-${topupId}`;
 }
 
-// memo에서 depositCode 파싱 (ex: "1-23-104"가 포함되어 있으면 매칭)
 function extractDepositCode(text) {
   if (!text) return null;
   const m = String(text).match(/\b(\d+)-(\d+)-(\d+)\b/);
@@ -81,7 +81,7 @@ function normalizeStatus(v, fallback = "ACTIVE") {
   return fallback;
 }
 
-// ✅ 보안 고려: 12자리 영문+숫자 랜덤 (혼동문자 제거)
+// ✅ 12자리 영문+숫자 랜덤 (혼동문자 제거)
 function generateSecureCode12() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // I,O,0,1 제거
   const bytes = crypto.randomBytes(12);
@@ -90,11 +90,11 @@ function generateSecureCode12() {
   return out;
 }
 
-// ✅ stores.auth_code 유니크 보장 생성
-async function generateUniqueStoreAuthCode() {
+// ✅ stores.merchant_code 유니크 보장 생성
+async function generateUniqueMerchantCode() {
   for (let i = 0; i < 50; i++) {
     const code = generateSecureCode12();
-    const exists = await pool.query("SELECT 1 FROM stores WHERE auth_code=$1", [code]);
+    const exists = await pool.query("SELECT 1 FROM stores WHERE merchant_code=$1", [code]);
     if (exists.rowCount === 0) return code;
   }
   return generateSecureCode12();
@@ -112,7 +112,6 @@ async function generateUniqueHeadOfficeCode() {
 
 // ----------------------------------------------------
 // Core: TOPUP 승인 처리(공통 함수)
-// - 관리자 승인 / 은행 자동확인 모두 여기 사용
 // ----------------------------------------------------
 async function applyTopupPaid({ topupId, memo = "입금확인 충전", refType = "TOPUP" }) {
   const client = await pool.connect();
@@ -157,7 +156,6 @@ async function applyTopupPaid({ topupId, memo = "입금확인 충전", refType =
     await client.query("COMMIT");
 
     const w = await pool.query("SELECT store_id, balance FROM store_wallets WHERE store_id=$1", [topup.store_id]);
-
     return { ok: true, topupId, storeId: topup.store_id, wallet: w.rows[0] };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -170,6 +168,7 @@ async function applyTopupPaid({ topupId, memo = "입금확인 충전", refType =
 // ----------------------------------------------------
 // AUTH
 // ----------------------------------------------------
+
 // 1) 본사 인증
 app.post("/auth/verify-head", async (req, res) => {
   const { inviteCode } = req.body;
@@ -198,7 +197,7 @@ app.post("/auth/login-store", async (req, res) => {
   try {
     const resStore = await pool.query(
       "SELECT id, name, head_office_id, status FROM stores WHERE id = $1 AND merchant_code = $2",
-      [storeId, merchantCode]
+      [storeId, String(merchantCode || "").trim().toUpperCase()]
     );
 
     if (resStore.rows.length > 0) {
@@ -222,7 +221,7 @@ app.post("/auth/login-store-by-code", async (req, res) => {
        FROM stores
        WHERE merchant_code = $1
        LIMIT 1`,
-      [merchantCode]
+      [String(merchantCode || "").trim().toUpperCase()]
     );
 
     if (result.rows.length === 0) {
@@ -232,29 +231,6 @@ app.post("/auth/login-store-by-code", async (req, res) => {
     return res.json({ success: true, message: "로그인 성공", store: result.rows[0] });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 4) 가맹점 인증코드(auth_code) 로그인
-app.post("/auth/login-store-by-authcode", async (req, res) => {
-  const { authCode } = req.body;
-  if (!authCode) return res.status(400).json({ success: false, message: "authCode 필요" });
-
-  try {
-    const r = await pool.query(
-      `SELECT id, head_office_id, name, status, auth_code
-       FROM stores
-       WHERE auth_code=$1
-       LIMIT 1`,
-      [String(authCode).trim().toUpperCase()]
-    );
-
-    if (r.rowCount === 0) return res.status(401).json({ success: false, message: "인증코드가 일치하지 않습니다." });
-    if (r.rows[0].status !== "ACTIVE") return res.status(403).json({ success: false, message: "비활성 가맹점입니다." });
-
-    res.json({ success: true, message: "로그인 성공", store: r.rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -285,7 +261,6 @@ app.post("/orders", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // store 확인 + headOfficeId
     const storeRes = await client.query("SELECT id, head_office_id FROM stores WHERE id = $1", [storeId]);
     if (storeRes.rows.length === 0) {
       await client.query("ROLLBACK");
@@ -293,7 +268,6 @@ app.post("/orders", async (req, res) => {
     }
     const headOfficeId = storeRes.rows[0].head_office_id;
 
-    // 상품 가격
     const productIds = items.map((i) => i.productId);
     const productsRes = await client.query(
       `SELECT id, price
@@ -305,7 +279,6 @@ app.post("/orders", async (req, res) => {
 
     const priceMap = new Map(productsRes.rows.map((p) => [p.id, p.price]));
 
-    // 총액 계산
     let total = 0;
     for (const it of items) {
       const price = priceMap.get(it.productId);
@@ -316,7 +289,6 @@ app.post("/orders", async (req, res) => {
       total += price * it.qty;
     }
 
-    // 지갑 잠금 + 부족 체크
     const w = await client.query("SELECT balance FROM store_wallets WHERE store_id=$1 FOR UPDATE", [storeId]);
 
     if (w.rows.length === 0) {
@@ -334,13 +306,11 @@ app.post("/orders", async (req, res) => {
       });
     }
 
-    // 잔액 차감
     await client.query("UPDATE store_wallets SET balance = balance - $1, updated_at=now() WHERE store_id=$2", [
       total,
       storeId,
     ]);
 
-    // 주문 생성
     const orderRes = await client.query(
       `INSERT INTO orders (store_id, head_office_id, status, total_amount)
        VALUES ($1, $2, 'pending', $3)
@@ -349,7 +319,6 @@ app.post("/orders", async (req, res) => {
     );
     const orderId = orderRes.rows[0].id;
 
-    // 주문 아이템
     for (const it of items) {
       const price = priceMap.get(it.productId);
       const lineTotal = price * it.qty;
@@ -360,7 +329,6 @@ app.post("/orders", async (req, res) => {
       );
     }
 
-    // 원장 기록(차감은 음수)
     await client.query(
       `INSERT INTO point_ledger(store_id, type, amount, ref_type, ref_id, memo)
        VALUES($1,'ORDER_DEBIT',$2,'ORDER',$3,'발주 결제 차감')`,
@@ -795,7 +763,7 @@ app.get("/master/stores", requireMaster, async (req, res) => {
 
   try {
     const r = await pool.query(
-      `SELECT id, head_office_id, name, address, phone, status, merchant_code, auth_code,
+      `SELECT id, head_office_id, name, address, phone, status, merchant_code,
               to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
        FROM stores
        WHERE head_office_id=$1
@@ -808,25 +776,34 @@ app.get("/master/stores", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 가맹점 단건 추가 (auth_code 자동 생성)
+// ✅ 가맹점 추가 (merchant_code 서버에서 자동 생성)
 app.post("/master/stores", requireMaster, async (req, res) => {
   const { headOfficeId, name, address, phone, status } = req.body;
-  if (!headOfficeId || !name) return res.status(400).json({ success: false, message: "headOfficeId/name 필요" });
+
+  if (!headOfficeId || !name) {
+    return res.status(400).json({ success: false, message: "headOfficeId/name 필요" });
+  }
 
   try {
-    const authCode = await generateUniqueStoreAuthCode();
+    const merchantCode = await generateUniqueMerchantCode();
+
     const r = await pool.query(
-      `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [headOfficeId, name, address || null, phone || null, status || "ACTIVE", authCode]
+      `INSERT INTO stores(head_office_id, name, merchant_code, address, phone, status)
+       VALUES($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [Number(headOfficeId), String(name).trim(), merchantCode, address || null, phone || null, status || "ACTIVE"]
     );
+
     res.json({ success: true, store: r.rows[0] });
   } catch (err) {
+    if (String(err.message || "").includes("merchant_code")) {
+      return res.status(409).json({ success: false, message: "가맹점 코드 생성 충돌. 다시 시도하세요." });
+    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ✅ 가맹점 엑셀 업로드 (본사코드 기준으로 매핑, auth_code 자동 생성)
+// ✅ 가맹점 엑셀 업로드 (본사코드 기준, merchant_code 자동 생성)
 app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
 
@@ -847,12 +824,12 @@ app.post("/master/stores/upload", requireMaster, upload.single("file"), async (r
       const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
       if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
 
-      const authCode = await generateUniqueStoreAuthCode();
+      const merchantCode = await generateUniqueMerchantCode();
 
       await pool.query(
-        `INSERT INTO stores(head_office_id, name, address, phone, status, auth_code)
+        `INSERT INTO stores(head_office_id, name, merchant_code, address, phone, status)
          VALUES($1,$2,$3,$4,$5,$6)`,
-        [h.rows[0].id, storeName, address, phone, status, authCode]
+        [h.rows[0].id, storeName, merchantCode, address, phone, status]
       );
 
       result.inserted++;
@@ -953,11 +930,11 @@ app.get("/__whoami", (req, res) => {
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 
-// SPA 라우팅 (API 경로 제외) ✅ master도 제외해야 함
+// SPA 라우팅 (API 경로 제외)
 app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
 });
 
-// 서버 실행 (✅ 맨 마지막)
+// 서버 실행
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT}`));
