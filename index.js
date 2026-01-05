@@ -439,7 +439,7 @@ app.get("/wallet", async (req, res) => {
 
 // ✅ 포인트 충전 요청 생성 + deposit_code 생성/저장/반환
 app.post("/topups/request", async (req, res) => {
-  const { storeId, amount, depositorName } = req.body;
+  const { storeId, amount } = req.body; // depositorName 제거
 
   const sid = Number(storeId);
   const amt = Number(amount);
@@ -460,34 +460,46 @@ app.post("/topups/request", async (req, res) => {
     const headOfficeId = Number(s.rows[0].head_office_id);
     const merchantCode = s.rows[0].merchant_code;
 
-    const prof = await client.query("SELECT depositor_name FROM store_profiles WHERE store_id=$1", [sid]);
-    const depositor = depositorName || (prof.rows[0]?.depositor_name ?? null);
-
+    // 1) 우선 requested 생성
     const r = await client.query(
       `INSERT INTO point_topups (store_id, amount, depositor_name, status)
-       VALUES ($1, $2, $3, 'requested')
-       RETURNING id, store_id, amount, status, depositor_name,
+       VALUES ($1, $2, NULL, 'requested')
+       RETURNING id, store_id, amount, status,
                  to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at`,
-      [sid, amt, depositor]
+      [sid, amt]
     );
 
     const topupId = Number(r.rows[0].id);
 
+    // 2) depositCode = 본사-가맹점-요청ID
     const depositCode = makeDepositCode(headOfficeId, sid, topupId);
-    await client.query("UPDATE point_topups SET deposit_code=$1 WHERE id=$2", [depositCode, topupId]);
+
+    // 3) deposit_code 저장 + depositor_name도 depositCode로 맞춰두기(예상 입금자명)
+    await client.query(
+      "UPDATE point_topups SET deposit_code=$1, depositor_name=$2 WHERE id=$3",
+      [depositCode, depositCode, topupId]
+    );
 
     await client.query("COMMIT");
 
+    // ✅ UX용 안내: 입금자명은 depositCode를 ‘그대로’ 사용하게 만들기
     const depositGuide = {
       bank: DEPOSIT.bank,
       account: DEPOSIT.account,
       holder: DEPOSIT.holder,
       depositCode,
-      memoRule: `받는통장표시(메모)에 ${depositCode} 입력`,
-      depositorRule: `입금자명(권장): ${merchantCode}`,
+      depositorNameToUse: depositCode,                 // ★ 핵심
+      depositorRule: `입금자명(필수): ${depositCode}`,   // ★ 핵심
+      memoRule: `받는통장표시(메모)에도 가능하면 ${depositCode} 입력`,
+      fallbackDepositorRule: `입금자명이 막히면(길이제한 등) 대신: ${merchantCode}`,
+      topupId, // 앱이 바로 보여줄 수 있도록
     };
 
-    return res.json({ success: true, topup: { ...r.rows[0], deposit_code: depositCode }, depositGuide });
+    return res.json({
+      success: true,
+      topup: { ...r.rows[0], deposit_code: depositCode, depositor_name: depositCode },
+      depositGuide
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     return res.status(500).json({ success: false, error: err.message });
@@ -495,6 +507,26 @@ app.post("/topups/request", async (req, res) => {
     client.release();
   }
 });
+app.get("/topups/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ success: false, message: "id 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, store_id, amount, status,
+              depositor_name, deposit_code,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+              to_char(paid_at, 'YYYY-MM-DD HH24:MI:SS') AS paid_at
+       FROM point_topups WHERE id=$1`,
+      [id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: "topup 없음" });
+    return res.json({ success: true, topup: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 
 app.get("/topups", async (req, res) => {
   const storeId = Number(req.query.storeId);
