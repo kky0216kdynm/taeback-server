@@ -507,6 +507,7 @@ app.post("/topups/request", async (req, res) => {
     client.release();
   }
 });
+
 app.get("/topups/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ success: false, message: "id 필요" });
@@ -961,6 +962,19 @@ app.get("/__whoami", (req, res) => {
 // ----------------------------------------------------
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
+
+app.get("/ibk/callback", async (req, res) => {
+  const { code, state } = req.query;
+
+  // IBK로 토큰 요청
+  // token = await getTokenFromIBK(code);
+
+  // 토큰을 저장/사용 처리
+  // 예: DB에 저장하거나 메모리 저장
+
+  res.send("IBK 인증 완료, 토큰 저장됨");
+});
+
 
 // SPA 라우팅 (API 경로 제외)
 app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
