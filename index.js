@@ -963,17 +963,9 @@ app.get("/__whoami", (req, res) => {
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 
-app.get("/ibk/callback", async (req, res) => {
-  const { code, state } = req.query;
+import ibkRouter from "./ibk.js";
+app.use("/ibk", ibkRouter);
 
-  // IBK로 토큰 요청
-  // token = await getTokenFromIBK(code);
-
-  // 토큰을 저장/사용 처리
-  // 예: DB에 저장하거나 메모리 저장
-
-  res.send("IBK 인증 완료, 토큰 저장됨");
-});
 
 
 // SPA 라우팅 (API 경로 제외)
