@@ -1,15 +1,18 @@
-import express from "express";
-import fetch from "node-fetch";
+const express = require("express");
 
 const router = express.Router();
 
 const IBK_CLIENT_ID = process.env.IBK_CLIENT_ID;
 const IBK_CLIENT_SECRET = process.env.IBK_CLIENT_SECRET;
-const IBK_REDIRECT_URI = process.env.IBK_REDIRECT_URI || "https://api.taeback.net/ibk/callback";
+const IBK_REDIRECT_URI =
+  process.env.IBK_REDIRECT_URI || "https://api.taeback.net/ibk/callback";
 
 // ✅ 포털 문서에서 확인해서 채우기
-const IBK_AUTH_URL = process.env.IBK_AUTH_URL;     // 예: https://.../oauth/authorize
-const IBK_TOKEN_URL = process.env.IBK_TOKEN_URL;   // 예: https://.../oauth/token
+const IBK_AUTH_URL = process.env.IBK_AUTH_URL; // 예: https://.../oauth/authorize
+const IBK_TOKEN_URL = process.env.IBK_TOKEN_URL; // 예: https://.../oauth/token
+
+// Node 20+ 내장 fetch 사용
+const fetchFn = globalThis.fetch;
 
 // (간단 저장: 운영은 DB/Redis 권장)
 let tokenStore = {
@@ -20,6 +23,14 @@ let tokenStore = {
 
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env: ${name}`);
+}
+
+function requireFetch() {
+  if (typeof fetchFn !== "function") {
+    throw new Error(
+      "fetch is not available. Use Node 18+ (this project uses Node 20) or install a fetch polyfill."
+    );
+  }
 }
 
 // 1) 인증 시작(브라우저에서 호출)
@@ -49,6 +60,8 @@ router.get("/auth", (req, res) => {
 // 2) 콜백: code → 토큰 교환
 router.get("/callback", async (req, res) => {
   try {
+    requireFetch();
+
     const code = req.query.code;
     if (!code) return res.status(400).send("Missing code");
 
@@ -60,20 +73,22 @@ router.get("/callback", async (req, res) => {
     body.set("client_id", IBK_CLIENT_ID);
     body.set("client_secret", IBK_CLIENT_SECRET);
 
-    const r = await fetch(IBK_TOKEN_URL, {
+    const r = await fetchFn(IBK_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
     });
 
     const text = await r.text();
-    if (!r.ok) return res.status(502).send(`Token exchange failed (${r.status}): ${text}`);
+    if (!r.ok) {
+      return res.status(502).send(`Token exchange failed (${r.status}): ${text}`);
+    }
 
     const json = JSON.parse(text);
 
     tokenStore.access_token = json.access_token;
     tokenStore.refresh_token = json.refresh_token || null;
-    tokenStore.expires_at = json.expires_in ? Date.now() + (json.expires_in * 1000) : null;
+    tokenStore.expires_at = json.expires_in ? Date.now() + json.expires_in * 1000 : null;
 
     return res.send("✅ IBK 인증 완료. 토큰 저장됨(서버).");
   } catch (e) {
@@ -89,4 +104,4 @@ router.get("/token", (req, res) => {
   });
 });
 
-export default router;
+module.exports = router;
