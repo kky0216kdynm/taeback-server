@@ -963,8 +963,6 @@ app.get("/__whoami", (req, res) => {
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 
-import ibkRouter from "./ibk.js";
-app.use("/ibk", ibkRouter);
 if (
   process.env.IBK_CLIENT_ID &&
   process.env.IBK_CLIENT_SECRET &&
