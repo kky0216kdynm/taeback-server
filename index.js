@@ -19,8 +19,11 @@ app.use(express.json());
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false, // 운영에서 SSL 필요하면 { rejectUnauthorized:false } 고려
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
+
 
 // ✅ DB 세션 타임존을 KST로 고정
 pool.on("connect", (client) => {
