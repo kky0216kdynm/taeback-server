@@ -68,12 +68,25 @@ function extractDepositCode(text) {
   return { headOfficeId: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
 }
 
-function readExcel(buffer) {
+function readExcel(buffer, filename = "") {
+  const name = String(filename || "").toLowerCase().trim();
+
+  // ✅ CSV는 문자열로 읽는 게 제일 안전
+  if (name.endsWith(".csv")) {
+    const csvText = buffer.toString("utf8");
+    const wb = xlsx.read(csvText, { type: "string" });
+    const sheetName = wb.SheetNames[0];
+    const sheet = wb.Sheets[sheetName];
+    return xlsx.utils.sheet_to_json(sheet, { defval: "" });
+  }
+
+  // ✅ xlsx/xls는 기존대로 buffer로
   const wb = xlsx.read(buffer, { type: "buffer" });
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   return xlsx.utils.sheet_to_json(sheet, { defval: "" });
 }
+
 
 function normalizeStatus(v, fallback = "ACTIVE") {
   const s = String(v || "").trim().toUpperCase();
@@ -884,7 +897,8 @@ app.post("/master/stores", requireMaster, async (req, res) => {
 app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
 
-  const rows = readExcel(req.file.buffer);
+  const rows = readExcel(req.file.buffer, req.file.originalname);
+
   const result = { inserted: 0, failed: [] };
 
   for (let i = 0; i < rows.length; i++) {
