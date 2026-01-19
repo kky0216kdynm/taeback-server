@@ -1,3 +1,6 @@
+const fs = require("fs");
+const fsp = require("fs/promises");
+const unzipper = require("unzipper");
 
 require("dotenv").config();
 const express = require("express");
@@ -109,6 +112,26 @@ async function generateUniqueHeadOfficeCode() {
   }
   return generateSecureCode12();
 }
+function normalizeNameForMatch(s) {
+  if (!s) return "";
+  return String(s)
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    // 공백 제거
+    .replace(/\s+/g, "")
+    // 파일명에서 자주 나오는 특수문자 제거 (원하면 더 추가 가능)
+    .replace(/[()[\]{}'"`~!@#$%^&*+=|\\:;,.?/<>]/g, "")
+    // 하이픈/언더스코어도 제거
+    .replace(/[-_]/g, "");
+}
+
+function getPublicBaseUrl(req) {
+  // Cloudtype/프록시 환경에서도 동작하게 X-Forwarded-Proto 고려
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  return `${proto}://${req.get("host")}`;
+}
+
 
 // ----------------------------------------------------
 // Core: TOPUP 승인 처리(공통 함수)
@@ -237,15 +260,36 @@ app.post("/auth/login-store-by-code", async (req, res) => {
 // ----------------------------------------------------
 // PRODUCTS (가맹점/본사 웹에서 사용)
 // ----------------------------------------------------
+
 app.get("/products", async (req, res) => {
   const { headOfficeId } = req.query;
+
+  if (!headOfficeId) {
+    return res.status(400).json({ success: false, error: "headOfficeId is required" });
+  }
+
   try {
-    const result = await pool.query("SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC", [headOfficeId]);
-    res.json({ success: true, products: result.rows });
+    const result = await pool.query(
+      "SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC",
+      [headOfficeId]
+    );
+
+    const base = getPublicBaseUrl(req);
+
+    const products = result.rows.map((p) => ({
+      ...p,
+      // DB에는 "/product-images/1/코카콜라355ml.jpg" 같이 저장되어 있다고 가정
+      image_url: p.image_url
+        ? (p.image_url.startsWith("http") ? p.image_url : `${base}${p.image_url}`)
+        : null,
+    }));
+
+    res.json({ success: true, products });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 // ----------------------------------------------------
 // ORDERS (포인트 차감 포함)
@@ -945,6 +989,137 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 
   res.json({ success: true, ...result });
 });
+// ✅ 상품 이미지 ZIP 업로드 (상품명.jpg 매핑)
+app.post("/master/products/images-zip", requireMaster, upload.single("file"), async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
+
+  // 안전장치 (원하는 값으로 조정)
+  const MAX_ZIP_BYTES = 50 * 1024 * 1024; // 50MB
+  if (req.file.size > MAX_ZIP_BYTES) {
+    return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (50MB 제한)" });
+  }
+
+  // 1) 본사 상품 목록 로드 -> nameKey 맵 만들기
+  let products;
+  try {
+    const r = await pool.query(
+      `SELECT id, name
+       FROM products
+       WHERE head_office_id=$1`,
+      [headOfficeId]
+    );
+    products = r.rows;
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "상품 조회 실패", error: err.message });
+  }
+
+  // key -> [productId...] (중복명 처리 위해 배열)
+  const nameKeyToIds = new Map();
+  for (const p of products) {
+    const key = normalizeNameForMatch(p.name);
+    if (!key) continue;
+    const arr = nameKeyToIds.get(key) || [];
+    arr.push(p.id);
+    nameKeyToIds.set(key, arr);
+  }
+
+  // 2) 저장 경로 준비
+  const outDir = path.join(productImagesRoot, String(headOfficeId));
+  await fsp.mkdir(outDir, { recursive: true });
+
+  const updated = [];
+  const skipped = [];
+
+  // 3) ZIP 스트림 처리 (Zip Slip 방지 + 이미지 확장자만)
+  try {
+    const zipStream = unzipper.Parse({ forceStream: true });
+    zipStream.on("entry", async (entry) => {
+      try {
+        const rawPath = entry.path || "";
+        const fileName = path.basename(rawPath);
+
+        // 디렉토리/숨김/이상경로 방지
+        if (entry.type === "Directory") {
+          entry.autodrain();
+          return;
+        }
+        if (!fileName || fileName.startsWith(".")) {
+          entry.autodrain();
+          return;
+        }
+        // Zip Slip 방지: basename 사용 + '..' 포함 금지
+        if (rawPath.includes("..")) {
+          skipped.push({ file: rawPath, reason: "unsafe path" });
+          entry.autodrain();
+          return;
+        }
+
+        const ext = path.extname(fileName).toLowerCase();
+        const allowed = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+        if (!allowed.has(ext)) {
+          skipped.push({ file: fileName, reason: "not an image" });
+          entry.autodrain();
+          return;
+        }
+
+        const stem = path.basename(fileName, ext); // 확장자 제거
+        const key = normalizeNameForMatch(stem);
+
+        const candidateIds = nameKeyToIds.get(key) || [];
+        if (candidateIds.length === 0) {
+          skipped.push({ file: fileName, reason: "no matching product name" });
+          entry.autodrain();
+          return;
+        }
+        if (candidateIds.length > 1) {
+          skipped.push({ file: fileName, reason: "duplicate product names (ambiguous)", productIds: candidateIds });
+          entry.autodrain();
+          return;
+        }
+        const productId = candidateIds[0];
+
+        // 파일명을 정규화해서 저장(공백/특수문자 제거) -> URL 안정성 ↑
+        const safeBase = key || `p${productId}`;
+        const savedFileName = `${safeBase}${ext}`;
+        const savePath = path.join(outDir, savedFileName);
+
+        // 저장 (stream -> file)
+        await new Promise((resolve, reject) => {
+          const ws = fs.createWriteStream(savePath);
+          entry.pipe(ws);
+          ws.on("finish", resolve);
+          ws.on("error", reject);
+        });
+
+        // DB 업데이트 (상대경로 저장)
+        const relUrl = `/product-images/${headOfficeId}/${savedFileName}`;
+        await pool.query(
+          `UPDATE products
+           SET image_url=$1
+           WHERE id=$2 AND head_office_id=$3`,
+          [relUrl, productId, headOfficeId]
+        );
+
+        updated.push({ productId, file: fileName, savedAs: savedFileName, image_url: relUrl });
+      } catch (e) {
+        skipped.push({ file: entry.path, reason: "processing error", error: e.message });
+        entry.autodrain();
+      }
+    });
+
+    zipStream.on("close", () => {
+      res.json({ success: true, headOfficeId: Number(headOfficeId), updatedCount: updated.length, updated, skipped });
+    });
+
+    // buffer -> stream
+    zipStream.end(req.file.buffer);
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "ZIP 처리 실패", error: err.message });
+  }
+});
+
 
 // ----------------------------------------------------
 // Health Check
@@ -956,6 +1131,12 @@ app.get("/__whoami", (req, res) => {
     time: new Date().toISOString(),
   });
 });
+
+// ----------------------------------------------------
+// Static for product images
+// ----------------------------------------------------
+const productImagesRoot = path.join(__dirname, "public", "product-images");
+app.use("/product-images", express.static(productImagesRoot));
 
 // ----------------------------------------------------
 // Static + SPA (✅ 반드시 맨 아래)
