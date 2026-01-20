@@ -1018,14 +1018,13 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
   if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
 
-  const MAX_ZIP_BYTES = 80 * 1024 * 1024; // 80MB (원하면 조정)
+  const hid = Number(headOfficeId);
+  const MAX_ZIP_BYTES = 120 * 1024 * 1024; // 120MB
   if (req.file.size > MAX_ZIP_BYTES) {
-    return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (80MB 제한)" });
+    return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
   }
 
-  const hid = Number(headOfficeId);
-
-  // ZIP 열기
+  // 0) ZIP 열기
   let directory;
   try {
     directory = await unzipper.Open.buffer(req.file.buffer);
@@ -1033,117 +1032,172 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     return res.status(400).json({ success: false, message: "ZIP 열기 실패", error: e.message });
   }
 
-  // 1) ZIP에서 csv/xlsx 1개 찾기
+  // 1) ZIP에서 csv/xlsx 1개 찾기 (파일명 유연)
   const sheetEntry = directory.files.find((f) => {
     if (f.type !== "File") return false;
     const p = (f.path || "").toLowerCase();
     return p.endsWith(".csv") || p.endsWith(".xlsx") || p.endsWith(".xls");
   });
-
   if (!sheetEntry) {
     return res.status(400).json({ success: false, message: "ZIP 안에 csv/xlsx 파일이 없습니다." });
   }
 
+  // 2) 시트 파싱
   const sheetBuf = await sheetEntry.buffer();
   const rows = readExcel(sheetBuf, sheetEntry.path);
 
-  // 2) 상품 upsert (unit 없음)
-  const result = {
+  // 결과 리포트
+  const report = {
     success: true,
     headOfficeId: hid,
     sheet: sheetEntry.path,
-    products: { inserted: 0, updated: 0, failed: [] },
+    products: { inserted: 0, updated: 0, failed: [], createdIds: [] },
     images: { updated: 0, skipped: [] },
   };
 
-  // 먼저 현재 본사 상품 맵(정확히는 name으로)
+  // 3) 현재 본사 상품 조회
   const existing = await pool.query(
     "SELECT id, name FROM products WHERE head_office_id=$1",
     [hid]
   );
-  const exactNameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
+  const idToName = new Map(existing.rows.map((p) => [p.id, p.name]));
+  const nameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
+  const nameKeyToIds = new Map();
+  for (const p of existing.rows) {
+    const k = normalizeNameForMatch(p.name);
+    const arr = nameKeyToIds.get(k) || [];
+    arr.push(p.id);
+    nameKeyToIds.set(k, arr);
+  }
 
+  // 4) 상품 처리: id 우선
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
+
     try {
-      const name = String(row.name || row.상품명 || "").trim();
-      const category = String(row.category || row.카테고리 || "").trim() || null;
-      const price = Number(row.price || row.가격);
-      const status = normalizeStatus(row.status || row.상태 || "ACTIVE", "ACTIVE");
+      const rawId = row.id ?? row.ID ?? row.Id ?? row["상품ID"];
+      const id = rawId === "" || rawId === null || rawId === undefined ? null : Number(rawId);
 
-      if (!name || Number.isNaN(price)) throw new Error("name/price 필수");
+      const name = String(row.name ?? row.상품명 ?? "").trim();
+      const category = String(row.category ?? row.카테고리 ?? "").trim() || null;
+      const price = Number(row.price ?? row.가격);
+      const status = normalizeStatus(row.status ?? row.상태 ?? "ACTIVE", "ACTIVE");
 
-      const id = exactNameToId.get(name);
+      if (!name) throw new Error("name 필수");
+      if (Number.isNaN(price)) throw new Error("price 필수(숫자)");
+
+      // (A) id가 있으면: 그 id를 업데이트 (본사 체크)
       if (id) {
+        const chk = await pool.query(
+          "SELECT id FROM products WHERE id=$1 AND head_office_id=$2",
+          [id, hid]
+        );
+        if (chk.rowCount === 0) {
+          throw new Error(`id=${id} 상품이 이 본사에 없음`);
+        }
+
         await pool.query(
           `UPDATE products
-             SET category=$1, price=$2, status=$3, updated_at=now()
-           WHERE id=$4 AND head_office_id=$5`,
-          [category, price, status, id, hid]
+              SET name=$1, category=$2, price=$3, status=$4, unit=NULL, updated_at=now()
+            WHERE id=$5 AND head_office_id=$6`,
+          [name, category, price, status, id, hid]
         );
-        result.products.updated++;
+
+        report.products.updated++;
+        idToName.set(id, name);
+        nameToId.set(name, id);
+        continue;
+      }
+
+      // (B) id가 없으면: name 기준 upsert
+      const existingId = nameToId.get(name);
+
+      if (existingId) {
+        await pool.query(
+          `UPDATE products
+              SET category=$1, price=$2, status=$3, unit=NULL, updated_at=now()
+            WHERE id=$4 AND head_office_id=$5`,
+          [category, price, status, existingId, hid]
+        );
+        report.products.updated++;
       } else {
         const ins = await pool.query(
           `INSERT INTO products(head_office_id, name, category, price, unit, status)
-           VALUES($1,$2,$3,$4,$5,$6)
-           RETURNING id`,
-          [hid, name, category, price, null, status] // unit 없음 -> null
+            VALUES($1,$2,$3,$4,$5,$6)
+            RETURNING id`,
+          [hid, name, category, price, null, status]
         );
-        exactNameToId.set(name, ins.rows[0].id);
-        result.products.inserted++;
+        const newId = ins.rows[0].id;
+        report.products.inserted++;
+        report.products.createdIds.push({ name, id: newId });
+
+        idToName.set(newId, name);
+        nameToId.set(name, newId);
       }
     } catch (e) {
-      result.products.failed.push({ rowIndex: i + 2, error: e.message });
+      report.products.failed.push({ rowIndex: i + 2, error: e.message });
     }
   }
 
-  // 3) 이미지 처리: name ↔ filename 매칭 (정규화)
+  // 5) 이미지 저장 폴더 준비
   const outDir = path.join(productImagesRoot, String(hid));
   await fsp.mkdir(outDir, { recursive: true });
 
-  // 최신 상품 목록 다시 로드(혹시 insert 반영)
-  const products2 = await pool.query(
+  // 6) 최신 상품 다시 로드(insert 반영) -> idToName, nameKeyToIds 갱신
+  const latest = await pool.query(
     "SELECT id, name FROM products WHERE head_office_id=$1",
     [hid]
   );
-
-  // normalizeKey -> [productId...]
-  const keyToIds = new Map();
-  for (const p of products2.rows) {
+  const latestIdToName = new Map(latest.rows.map((p) => [p.id, p.name]));
+  const latestNameKeyToIds = new Map();
+  for (const p of latest.rows) {
     const k = normalizeNameForMatch(p.name);
-    const arr = keyToIds.get(k) || [];
+    const arr = latestNameKeyToIds.get(k) || [];
     arr.push(p.id);
-    keyToIds.set(k, arr);
+    latestNameKeyToIds.set(k, arr);
   }
 
+  // 7) 이미지 처리: id.jpg 우선 / name.jpg fallback
   const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
-
-  const imageFiles = directory.files.filter((f) => {
+  const imageEntries = directory.files.filter((f) => {
     if (f.type !== "File") return false;
     const ext = path.extname(f.path || "").toLowerCase();
     return allowedExt.has(ext);
   });
 
-  for (const f of imageFiles) {
+  for (const f of imageEntries) {
     try {
-      const original = path.basename(f.path || "");
-      const ext = path.extname(original).toLowerCase();
-      const stem = path.basename(original, ext);
-      const key = normalizeNameForMatch(stem);
+      const ext = path.extname(f.path || "").toLowerCase();
 
-      const ids = keyToIds.get(key) || [];
-      if (ids.length === 0) {
-        result.images.skipped.push({ file: f.path, reason: "no matching product name" });
+      // (A) 파일명이 숫자면 id로 처리 (최우선)
+      let productId = parseIdFromFilename(f.path);
+
+      // (B) 아니면 name 기준 fallback
+      if (!productId) {
+        const base = path.basename(f.path || "");
+        const stem = path.basename(base, ext);
+        const key = normalizeNameForMatch(stem);
+        const ids = latestNameKeyToIds.get(key) || [];
+
+        if (ids.length === 0) {
+          report.images.skipped.push({ file: f.path, reason: "no matching product (id or name)" });
+          continue;
+        }
+        if (ids.length > 1) {
+          report.images.skipped.push({ file: f.path, reason: "ambiguous name (duplicate products)", productIds: ids });
+          continue;
+        }
+        productId = ids[0];
+      }
+
+      // 본사 체크
+      if (!latestIdToName.has(productId)) {
+        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
         continue;
       }
-      if (ids.length > 1) {
-        result.images.skipped.push({ file: f.path, reason: "ambiguous (duplicate product names)", productIds: ids });
-        continue;
-      }
 
-      const productId = ids[0];
-      const safeName = key || `p${productId}`;
-      const savedFileName = `${safeName}${ext}`;
+      // ✅ 저장 파일명은 무조건 ASCII: p{productId}.ext
+      const savedFileName = `p${productId}${ext}`;
       const savePath = path.join(outDir, savedFileName);
 
       const buf = await f.buffer();
@@ -1152,18 +1206,19 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
       const relUrl = `/product-images/${hid}/${savedFileName}`;
       await pool.query(
         `UPDATE products SET image_url=$1, updated_at=now()
-         WHERE id=$2 AND head_office_id=$3`,
+          WHERE id=$2 AND head_office_id=$3`,
         [relUrl, productId, hid]
       );
 
-      result.images.updated++;
+      report.images.updated++;
     } catch (e) {
-      result.images.skipped.push({ file: f.path, reason: "processing error", error: e.message });
+      report.images.skipped.push({ file: f.path, reason: "processing error", error: e.message });
     }
   }
 
-  res.json(result);
+  res.json(report);
 });
+
 
 
 // ----------------------------------------------------
