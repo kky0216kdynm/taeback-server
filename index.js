@@ -12,6 +12,8 @@ const crypto = require("crypto");
 const multer = require("multer");
 const xlsx = require("xlsx");
 const upload = multer({ storage: multer.memoryStorage() });
+const uploadAny = multer({ storage: multer.memoryStorage() }).any();
+
 
 const app = express();
 app.use(cors());
@@ -988,31 +990,33 @@ app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
 });
 
 // ✅ 상품 엑셀 업로드 (본사코드 기준)
-app.post("/master/products/upload", requireMaster, upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
+app.post("/master/products/upload", requireMaster, uploadAny, async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
-  const rows = readExcel(req.file.buffer);
+  const file = (req.files && req.files[0]) || null;
+  if (!file) return res.status(400).json({ success: false, message: "file 필요 (FormData key가 file이 아닐 수도 있음)" });
+
+  const hid = Number(headOfficeId);
+  const rows = readExcel(file.buffer, file.originalname);
+
   const result = { inserted: 0, failed: [] };
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     try {
-      const headOfficeCode = String(row.head_office_code || row.본사코드 || "").trim();
-      const name = String(row.name || row.상품명 || "").trim();
-      const category = String(row.category || row.카테고리 || "").trim() || null;
-      const price = Number(row.price || row.가격);
-      const unit = String(row.unit || row.단위 || "").trim() || null;
-      const status = normalizeStatus(row.status || row.상태 || "ACTIVE", "ACTIVE");
+      const name = String(row.name ?? row.상품명 ?? "").trim();
+      const category = String(row.category ?? row.카테고리 ?? "").trim() || null;
+      const price = Number(row.price ?? row.가격);
+      const status = normalizeStatus(row.status ?? row.상태 ?? "ACTIVE", "ACTIVE");
 
-      if (!headOfficeCode || !name || Number.isNaN(price)) throw new Error("head_office_code/name/price 필수");
-
-      const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
-      if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
+      if (!name) throw new Error("name(상품명) 필수");
+      if (Number.isNaN(price)) throw new Error("price(가격) 필수(숫자)");
 
       await pool.query(
-        `INSERT INTO products(head_office_id, name, category, price, unit, status)
-         VALUES($1,$2,$3,$4,$5,$6)`,
-        [h.rows[0].id, name, category, price, unit, status]
+        `INSERT INTO products(head_office_id, name, category, price, status)
+         VALUES($1,$2,$3,$4,$5)`,
+        [hid, name, category, price, status]
       );
 
       result.inserted++;
@@ -1298,20 +1302,23 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 //   - ZIP 내부: (csv/xlsx/xls 1개) + (이미지들)
 //   - 이미지 파일명: 12.jpg / p12.jpg / 삼겹살.jpg(이름매칭 fallback)
 // ----------------------------------------------------
-app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
+app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
-  if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
+
+  const file = (req.files && req.files[0]) || null;
+  if (!file) return res.status(400).json({ success: false, message: "file(zip) 필요 (FormData key가 file이 아닐 수도 있음)" });
 
   const hid = Number(headOfficeId);
-  const MAX_ZIP_BYTES = 120 * 1024 * 1024; // 120MB
-  if (req.file.size > MAX_ZIP_BYTES) {
+
+  const MAX_ZIP_BYTES = 120 * 1024 * 1024;
+  if (file.size > MAX_ZIP_BYTES) {
     return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
   }
 
   let directory;
   try {
-    directory = await unzipper.Open.buffer(req.file.buffer);
+    directory = await unzipper.Open.buffer(file.buffer);
   } catch (e) {
     return res.status(400).json({ success: false, message: "ZIP 열기 실패", error: e.message });
   }
@@ -1336,11 +1343,9 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     images: { updated: 0, skipped: [] },
   };
 
-  // 현재 본사 상품
   const existing = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
   const nameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
 
-  // 1) 상품 upsert
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     try {
@@ -1356,7 +1361,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
       if (Number.isNaN(price)) throw new Error("price 필수(숫자)");
 
       if (id) {
-        // id가 있으면 해당 id가 이 본사 상품인지 확인 후 update
         const chk = await pool.query("SELECT id FROM products WHERE id=$1 AND head_office_id=$2", [id, hid]);
         if (chk.rowCount === 0) throw new Error(`id=${id} 상품이 이 본사에 없음`);
 
@@ -1372,7 +1376,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
         continue;
       }
 
-      // id 없으면 name 기준 업데이트/삽입
       const existingId = nameToId.get(name);
       if (existingId) {
         await pool.query(
@@ -1399,11 +1402,9 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     }
   }
 
-  // 2) 이미지 저장 폴더 준비
   const outDir = path.join(productImagesRoot, String(hid));
   await fsp.mkdir(outDir, { recursive: true });
 
-  // 최신 상품 다시 로드 (이름 매칭 fallback용)
   const latest = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
   const latestIdToName = new Map(latest.rows.map((p) => [p.id, p.name]));
   const latestNameKeyToIds = new Map();
@@ -1414,7 +1415,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     latestNameKeyToIds.set(k, arr);
   }
 
-  // 3) 이미지 처리
   const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
   const imageEntries = directory.files.filter((f) => {
     if (f.type !== "File") return false;
@@ -1426,10 +1426,8 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     try {
       const ext = path.extname(f.path || "").toLowerCase();
 
-      // (A) 파일명이 숫자면 id 매칭
       let productId = parseIdFromFilename(f.path);
 
-      // (B) 아니면 name 매칭 (한글 파일명 포함)
       if (!productId) {
         const base = path.basename(f.path || "");
         const stem = path.basename(base, ext);
@@ -1452,7 +1450,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
         continue;
       }
 
-      // 저장 파일명은 ASCII로 고정 (URL 인코딩 문제 회피)
       const savedFileName = `p${productId}${ext}`;
       const savePath = path.join(outDir, savedFileName);
 
@@ -1474,6 +1471,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 
   res.json(report);
 });
+
 
 // ----------------------------------------------------
 // ✅ [추가] 기존 한글 파일명 이미지 자동 마이그레이션 (1회 실행용)
