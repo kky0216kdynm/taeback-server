@@ -1198,11 +1198,282 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 
 
 // ----------------------------------------------------
-// Static for product images
+// Static for product images  ✅ (라우트보다 위에 있어야 함)
 // ----------------------------------------------------
 const productImagesRoot = path.join(__dirname, "public", "product-images");
 app.use("/product-images", express.static(productImagesRoot));
 
+// ----------------------------------------------------
+// ✅ 상품 목록 (본사 선택 후)
+// ----------------------------------------------------
+app.get("/master/products", requireMaster, async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, head_office_id, name, category, price, image_url, status,
+              to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
+       FROM products
+       WHERE head_office_id=$1
+       ORDER BY id DESC`,
+      [Number(headOfficeId)]
+    );
+
+    const base = getPublicBaseUrl(req);
+    const products = r.rows.map((p) => {
+      const abs = p.image_url
+        ? (p.image_url.startsWith("http") ? p.image_url : `${base}${p.image_url}`)
+        : null;
+      return { ...p, image_url: abs, imageUrl: abs };
+    });
+
+    res.json({ success: true, products });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// ✅ 상품 품절 토글 (status만: ACTIVE / SOLD_OUT / INACTIVE)
+// ----------------------------------------------------
+app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  try {
+    const r = await pool.query(
+      "UPDATE products SET status=$1, updated_at=now() WHERE id=$2 RETURNING *",
+      [normalizeStatus(status, "ACTIVE"), Number(id)]
+    );
+    res.json({ success: true, product: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// ✅ 상품 엑셀 업로드 (✅ headOfficeId로만 업로드 / head_office_code 제거)
+//   - Query: /master/products/upload?headOfficeId=4
+//   - 파일 컬럼: name, category, price, status
+// ----------------------------------------------------
+app.post("/master/products/upload", requireMaster, upload.single("file"), async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
+
+  const hid = Number(headOfficeId);
+  const rows = readExcel(req.file.buffer, req.file.originalname);
+  const result = { inserted: 0, failed: [] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      const name = String(row.name ?? row.상품명 ?? "").trim();
+      const category = String(row.category ?? row.카테고리 ?? "").trim() || null;
+      const price = Number(row.price ?? row.가격);
+      const status = normalizeStatus(row.status ?? row.상태 ?? "ACTIVE", "ACTIVE");
+
+      if (!name) throw new Error("name(상품명) 필수");
+      if (Number.isNaN(price)) throw new Error("price(가격) 필수(숫자)");
+
+      await pool.query(
+        `INSERT INTO products(head_office_id, name, category, price, status)
+         VALUES($1,$2,$3,$4,$5)`,
+        [hid, name, category, price, status]
+      );
+
+      result.inserted++;
+    } catch (e) {
+      result.failed.push({ rowIndex: i + 2, error: e.message });
+    }
+  }
+
+  res.json({ success: true, ...result });
+});
+
+// ----------------------------------------------------
+// ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
+//   - Query: /master/products/batch-zip?headOfficeId=4
+//   - ZIP 내부: (csv/xlsx/xls 1개) + (이미지들)
+//   - 이미지 파일명: 12.jpg / p12.jpg / 삼겹살.jpg(이름매칭 fallback)
+// ----------------------------------------------------
+app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
+
+  const hid = Number(headOfficeId);
+  const MAX_ZIP_BYTES = 120 * 1024 * 1024; // 120MB
+  if (req.file.size > MAX_ZIP_BYTES) {
+    return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
+  }
+
+  let directory;
+  try {
+    directory = await unzipper.Open.buffer(req.file.buffer);
+  } catch (e) {
+    return res.status(400).json({ success: false, message: "ZIP 열기 실패", error: e.message });
+  }
+
+  const sheetEntry = directory.files.find((f) => {
+    if (f.type !== "File") return false;
+    const p = (f.path || "").toLowerCase();
+    return p.endsWith(".csv") || p.endsWith(".xlsx") || p.endsWith(".xls");
+  });
+  if (!sheetEntry) {
+    return res.status(400).json({ success: false, message: "ZIP 안에 csv/xlsx 파일이 없습니다." });
+  }
+
+  const sheetBuf = await sheetEntry.buffer();
+  const rows = readExcel(sheetBuf, sheetEntry.path);
+
+  const report = {
+    success: true,
+    headOfficeId: hid,
+    sheet: sheetEntry.path,
+    products: { inserted: 0, updated: 0, failed: [], createdIds: [] },
+    images: { updated: 0, skipped: [] },
+  };
+
+  // 현재 본사 상품
+  const existing = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
+  const nameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
+
+  // 1) 상품 upsert
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      const rawId = row.id ?? row.ID ?? row.Id ?? row["상품ID"];
+      const id = rawId === "" || rawId === null || rawId === undefined ? null : Number(rawId);
+
+      const name = String(row.name ?? row.상품명 ?? "").trim();
+      const category = String(row.category ?? row.카테고리 ?? "").trim() || null;
+      const price = Number(row.price ?? row.가격);
+      const status = normalizeStatus(row.status ?? row.상태 ?? "ACTIVE", "ACTIVE");
+
+      if (!name) throw new Error("name 필수");
+      if (Number.isNaN(price)) throw new Error("price 필수(숫자)");
+
+      if (id) {
+        // id가 있으면 해당 id가 이 본사 상품인지 확인 후 update
+        const chk = await pool.query("SELECT id FROM products WHERE id=$1 AND head_office_id=$2", [id, hid]);
+        if (chk.rowCount === 0) throw new Error(`id=${id} 상품이 이 본사에 없음`);
+
+        await pool.query(
+          `UPDATE products
+              SET name=$1, category=$2, price=$3, status=$4, updated_at=now()
+            WHERE id=$5 AND head_office_id=$6`,
+          [name, category, price, status, id, hid]
+        );
+
+        report.products.updated++;
+        nameToId.set(name, id);
+        continue;
+      }
+
+      // id 없으면 name 기준 업데이트/삽입
+      const existingId = nameToId.get(name);
+      if (existingId) {
+        await pool.query(
+          `UPDATE products
+              SET category=$1, price=$2, status=$3, updated_at=now()
+            WHERE id=$4 AND head_office_id=$5`,
+          [category, price, status, existingId, hid]
+        );
+        report.products.updated++;
+      } else {
+        const ins = await pool.query(
+          `INSERT INTO products(head_office_id, name, category, price, status)
+            VALUES($1,$2,$3,$4,$5)
+            RETURNING id`,
+          [hid, name, category, price, status]
+        );
+        const newId = ins.rows[0].id;
+        report.products.inserted++;
+        report.products.createdIds.push({ name, id: newId });
+        nameToId.set(name, newId);
+      }
+    } catch (e) {
+      report.products.failed.push({ rowIndex: i + 2, error: e.message });
+    }
+  }
+
+  // 2) 이미지 저장 폴더 준비
+  const outDir = path.join(productImagesRoot, String(hid));
+  await fsp.mkdir(outDir, { recursive: true });
+
+  // 최신 상품 다시 로드 (이름 매칭 fallback용)
+  const latest = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
+  const latestIdToName = new Map(latest.rows.map((p) => [p.id, p.name]));
+  const latestNameKeyToIds = new Map();
+  for (const p of latest.rows) {
+    const k = normalizeNameForMatch(p.name);
+    const arr = latestNameKeyToIds.get(k) || [];
+    arr.push(p.id);
+    latestNameKeyToIds.set(k, arr);
+  }
+
+  // 3) 이미지 처리
+  const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+  const imageEntries = directory.files.filter((f) => {
+    if (f.type !== "File") return false;
+    const ext = path.extname(f.path || "").toLowerCase();
+    return allowedExt.has(ext);
+  });
+
+  for (const f of imageEntries) {
+    try {
+      const ext = path.extname(f.path || "").toLowerCase();
+
+      // (A) 파일명이 숫자면 id 매칭
+      let productId = parseIdFromFilename(f.path);
+
+      // (B) 아니면 name 매칭 (한글 파일명 포함)
+      if (!productId) {
+        const base = path.basename(f.path || "");
+        const stem = path.basename(base, ext);
+        const key = normalizeNameForMatch(stem);
+        const ids = latestNameKeyToIds.get(key) || [];
+
+        if (ids.length === 0) {
+          report.images.skipped.push({ file: f.path, reason: "no matching product (id or name)" });
+          continue;
+        }
+        if (ids.length > 1) {
+          report.images.skipped.push({ file: f.path, reason: "ambiguous name (duplicate products)", productIds: ids });
+          continue;
+        }
+        productId = ids[0];
+      }
+
+      if (!latestIdToName.has(productId)) {
+        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
+        continue;
+      }
+
+      // 저장 파일명은 ASCII로 고정 (URL 인코딩 문제 회피)
+      const savedFileName = `p${productId}${ext}`;
+      const savePath = path.join(outDir, savedFileName);
+
+      const buf = await f.buffer();
+      await fsp.writeFile(savePath, buf);
+
+      const relUrl = `/product-images/${hid}/${savedFileName}`;
+      await pool.query(
+        `UPDATE products SET image_url=$1, updated_at=now()
+          WHERE id=$2 AND head_office_id=$3`,
+        [relUrl, productId, hid]
+      );
+
+      report.images.updated++;
+    } catch (e) {
+      report.images.skipped.push({ file: f.path, reason: "processing error", error: e.message });
+    }
+  }
+
+  res.json(report);
+});
 
 // ----------------------------------------------------
 // ✅ [추가] 기존 한글 파일명 이미지 자동 마이그레이션 (1회 실행용)
@@ -1215,11 +1486,9 @@ async function fileExists(p) {
     return false;
   }
 }
-
 function getExtFromPath(p) {
   return path.extname(p || "").toLowerCase();
 }
-
 function isAllowedImageExt(ext) {
   return [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
 }
@@ -1242,8 +1511,7 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
     conflicts: [],
   };
 
-  const dirExists = await fileExists(dir);
-  if (!dirExists) {
+  if (!(await fileExists(dir))) {
     report.notFound.push({ id: null, reason: `directory not found: ${dir}` });
     return report;
   }
@@ -1265,7 +1533,7 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
   for (const p of products) {
     const productId = p.id;
 
-    // 이미 p{id}.ext 존재하면 스킵 + DB 보정
+    // 이미 p{id}.ext가 있으면 DB만 보정하고 스킵
     const already = files.find((f) => {
       const ext = getExtFromPath(f);
       if (!isAllowedImageExt(ext)) return false;
@@ -1286,26 +1554,22 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
       continue;
     }
 
-    // 우선 DB image_url 파일을 사용
+    // DB image_url 파일 우선
     let srcFile = null;
     if (p.image_url) {
       const u = String(p.image_url);
       const idx = u.indexOf("/product-images/");
       const rel = idx >= 0 ? u.slice(idx) : u;
       const baseName = path.basename(rel);
-      if (baseName) {
-        const candidatePath = path.join(dir, baseName);
-        if (await fileExists(candidatePath)) srcFile = baseName;
-      }
+      if (baseName && (await fileExists(path.join(dir, baseName)))) srcFile = baseName;
     }
 
     // 없으면 name으로 찾기
     if (!srcFile) {
       const key = normalizeNameForMatch(p.name);
       const candidates = nameKeyToFiles.get(key) || [];
-      if (candidates.length === 1) {
-        srcFile = candidates[0];
-      } else if (candidates.length > 1) {
+      if (candidates.length === 1) srcFile = candidates[0];
+      else if (candidates.length > 1) {
         report.conflicts.push({ id: productId, reason: `multiple image candidates for name (${p.name})`, candidates });
         continue;
       }
@@ -1322,8 +1586,8 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
       continue;
     }
 
-    const srcPath = path.join(dir, srcFile);
     const dstFile = `p${productId}${srcExt}`;
+    const srcPath = path.join(dir, srcFile);
     const dstPath = path.join(dir, dstFile);
 
     if (await fileExists(dstPath)) {
@@ -1339,8 +1603,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
         "UPDATE products SET image_url=$1, updated_at=now() WHERE id=$2 AND head_office_id=$3",
         [relUrl, productId, hid]
       );
-      // 원본 삭제는 안전상 기본 OFF
-      // await fsp.unlink(srcPath);
     }
 
     report.migrated.push({ id: productId, from: srcFile, to: dstFile });
@@ -1363,6 +1625,7 @@ app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
     res.status(500).json({ success: false, message: "migrate failed", error: e.message });
   }
 });
+
 
 
 // ----------------------------------------------------
