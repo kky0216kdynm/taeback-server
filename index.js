@@ -23,7 +23,14 @@ const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
 const R2_BUCKET = process.env.R2_BUCKET || "taeback-product-images";
-const R2_PUBLIC_BASE = (process.env.R2_PUBLIC_BASE || "").replace(/\/$/, "");
+const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+
+// /product-images/* 요청이 오면 R2로 302 리다이렉트
+app.get("/product-images/*", (req, res) => {
+  if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
+  return res.redirect(302, `${R2_PUBLIC_BASE_URL}${req.path}`);
+});
+
 
 const r2 = new S3Client({
   region: "auto",
@@ -1068,8 +1075,10 @@ async function uploadToR2({ key, body, contentType }) {
       ContentType: contentType,
     })
   );
-  return `${R2_PUBLIC_BASE}/${key}`;
+  // ✅ 여기서는 URL을 반환하지 말고 업로드만 책임지게 두는게 안전
+  return true;
 }
+
 
 // ----------------------------------------------------
 // ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
@@ -1344,34 +1353,33 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 //   - ZIP 내부: (csv/xlsx/xls 1개) + (이미지들)
 //   - 이미지 파일명: 12.jpg / p12.jpg / 삼겹살.jpg(이름매칭 fallback)
 // ----------------------------------------------------
-app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res) => {
+app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
-
-  const file = (req.files && req.files[0]) || null;
-  if (!file) return res.status(400).json({ success: false, message: "file(zip) 필요 (FormData key가 file이 아닐 수도 있음)" });
+  if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
 
   const hid = Number(headOfficeId);
 
   const MAX_ZIP_BYTES = 120 * 1024 * 1024;
-  if (file.size > MAX_ZIP_BYTES) {
+  if (req.file.size > MAX_ZIP_BYTES) {
     return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
   }
 
   let directory;
   try {
-    directory = await unzipper.Open.buffer(file.buffer);
+    directory = await unzipper.Open.buffer(req.file.buffer);
   } catch (e) {
     return res.status(400).json({ success: false, message: "ZIP 열기 실패", error: e.message });
   }
 
+  // 1) ZIP 안의 엑셀/CSV 찾기
   const sheetEntry = directory.files.find((f) => {
     if (f.type !== "File") return false;
     const p = (f.path || "").toLowerCase();
     return p.endsWith(".csv") || p.endsWith(".xlsx") || p.endsWith(".xls");
   });
   if (!sheetEntry) {
-    return res.status(400).json({ success: false, message: "ZIP 안에 csv/xlsx 파일이 없습니다." });
+    return res.status(400).json({ success: false, message: "ZIP 안에 csv/xlsx/xls 파일이 없습니다." });
   }
 
   const sheetBuf = await sheetEntry.buffer();
@@ -1385,9 +1393,11 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
     images: { updated: 0, skipped: [] },
   };
 
+  // 2) 기존 상품 맵
   const existing = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
   const nameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
 
+  // 3) 시트로 상품 upsert(이름 기준 + id 있으면 우선)
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     try {
@@ -1408,8 +1418,8 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
 
         await pool.query(
           `UPDATE products
-              SET name=$1, category=$2, price=$3, status=$4, updated_at=now()
-            WHERE id=$5 AND head_office_id=$6`,
+             SET name=$1, category=$2, price=$3, status=$4, updated_at=now()
+           WHERE id=$5 AND head_office_id=$6`,
           [name, category, price, status, id, hid]
         );
 
@@ -1422,16 +1432,16 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
       if (existingId) {
         await pool.query(
           `UPDATE products
-              SET category=$1, price=$2, status=$3, updated_at=now()
-            WHERE id=$4 AND head_office_id=$5`,
+             SET category=$1, price=$2, status=$3, updated_at=now()
+           WHERE id=$4 AND head_office_id=$5`,
           [category, price, status, existingId, hid]
         );
         report.products.updated++;
       } else {
         const ins = await pool.query(
           `INSERT INTO products(head_office_id, name, category, price, status)
-            VALUES($1,$2,$3,$4,$5)
-            RETURNING id`,
+           VALUES($1,$2,$3,$4,$5)
+           RETURNING id`,
           [hid, name, category, price, status]
         );
         const newId = ins.rows[0].id;
@@ -1444,7 +1454,27 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
     }
   }
 
-  // 🔥 R2 업로드로 변경 (로컬 폴더 저장 제거)
+  // 4) 최신 상품 다시 로드해서 "이름 매칭 fallback" 만들기
+  const latest = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
+
+  const latestIdToName = new Set(latest.rows.map((p) => p.id));
+  const latestNameKeyToIds = new Map();
+  for (const p of latest.rows) {
+    const k = normalizeNameForMatch(p.name);
+    const arr = latestNameKeyToIds.get(k) || [];
+    arr.push(p.id);
+    latestNameKeyToIds.set(k, arr);
+  }
+
+  // 5) ZIP 안의 이미지 엔트리
+  const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+  const imageEntries = directory.files.filter((f) => {
+    if (f.type !== "File") return false;
+    const ext = path.extname(f.path || "").toLowerCase();
+    return allowedExt.has(ext);
+  });
+
+  // 6) 이미지 업로드 + DB 업데이트 (DB는 상대경로 유지!)
   for (const f of imageEntries) {
     try {
       const ext = path.extname(f.path || "").toLowerCase();
@@ -1473,21 +1503,24 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
         continue;
       }
 
-      // ✅ R2에 저장될 key 규칙
+      // ✅ R2 object key (R2에서 실제 경로)
       const objectKey = `product-images/${hid}/p${productId}${ext}`;
 
       const buf = await f.buffer();
 
-      const imageUrl = await uploadToR2({
+      await uploadToR2({
         key: objectKey,
         body: buf,
         contentType: guessContentTypeByExt(ext),
       });
 
+      // ✅ DB에는 상대경로로 저장 (기존 프론트 호환)
+      const relUrl = `/product-images/${hid}/p${productId}${ext}`;
+
       await pool.query(
         `UPDATE products SET image_url=$1, updated_at=now()
          WHERE id=$2 AND head_office_id=$3`,
-        [imageUrl, productId, hid]
+        [relUrl, productId, hid]
       );
 
       report.images.updated++;
@@ -1498,6 +1531,7 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
 
   res.json(report);
 });
+
 
 
 // ----------------------------------------------------
