@@ -1,3 +1,4 @@
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const unzipper = require("unzipper");
@@ -18,6 +19,21 @@ const uploadAny = multer({ storage: multer.memoryStorage() }).any();
 const app = express();
 app.use(cors());
 app.use(express.json());
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
+const R2_BUCKET = process.env.R2_BUCKET || "taeback-product-images";
+const R2_PUBLIC_BASE = (process.env.R2_PUBLIC_BASE || "").replace(/\/$/, "");
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY,
+  },
+});
+
 
 // ----------------------------------------------------
 // DB
@@ -1028,6 +1044,32 @@ app.post("/master/products/upload", requireMaster, uploadAny, async (req, res) =
   res.json({ success: true, ...result });
 });
 
+//업로드 헬퍼 이미지 호스팅
+function guessContentTypeByExt(ext) {
+  switch (ext) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".webp":
+      return "image/webp";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function uploadToR2({ key, body, contentType }) {
+  await r2.send(
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+    })
+  );
+  return `${R2_PUBLIC_BASE}/${key}`;
+}
 
 // ----------------------------------------------------
 // ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
@@ -1205,7 +1247,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 // Static for product images  ✅ (라우트보다 위에 있어야 함)
 // ----------------------------------------------------
 const productImagesRoot = path.join(__dirname, "public", "product-images");
-app.use("/product-images", express.static(productImagesRoot));
+
 
 // ----------------------------------------------------
 // ✅ 상품 목록 (본사 선택 후)
@@ -1402,26 +1444,7 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
     }
   }
 
-  const outDir = path.join(productImagesRoot, String(hid));
-  await fsp.mkdir(outDir, { recursive: true });
-
-  const latest = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
-  const latestIdToName = new Map(latest.rows.map((p) => [p.id, p.name]));
-  const latestNameKeyToIds = new Map();
-  for (const p of latest.rows) {
-    const k = normalizeNameForMatch(p.name);
-    const arr = latestNameKeyToIds.get(k) || [];
-    arr.push(p.id);
-    latestNameKeyToIds.set(k, arr);
-  }
-
-  const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
-  const imageEntries = directory.files.filter((f) => {
-    if (f.type !== "File") return false;
-    const ext = path.extname(f.path || "").toLowerCase();
-    return allowedExt.has(ext);
-  });
-
+  // 🔥 R2 업로드로 변경 (로컬 폴더 저장 제거)
   for (const f of imageEntries) {
     try {
       const ext = path.extname(f.path || "").toLowerCase();
@@ -1450,17 +1473,21 @@ app.post("/master/products/batch-zip", requireMaster, uploadAny, async (req, res
         continue;
       }
 
-      const savedFileName = `p${productId}${ext}`;
-      const savePath = path.join(outDir, savedFileName);
+      // ✅ R2에 저장될 key 규칙
+      const objectKey = `product-images/${hid}/p${productId}${ext}`;
 
       const buf = await f.buffer();
-      await fsp.writeFile(savePath, buf);
 
-      const relUrl = `/product-images/${hid}/${savedFileName}`;
+      const imageUrl = await uploadToR2({
+        key: objectKey,
+        body: buf,
+        contentType: guessContentTypeByExt(ext),
+      });
+
       await pool.query(
         `UPDATE products SET image_url=$1, updated_at=now()
-          WHERE id=$2 AND head_office_id=$3`,
-        [relUrl, productId, hid]
+         WHERE id=$2 AND head_office_id=$3`,
+        [imageUrl, productId, hid]
       );
 
       report.images.updated++;
