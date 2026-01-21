@@ -16,6 +16,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 // ----------------------------------------------------
 // DB
 // ----------------------------------------------------
@@ -55,17 +56,16 @@ function requireMaster(req, res, next) {
 // ----------------------------------------------------
 // Utils
 // ----------------------------------------------------
-function makeDepositCode(headOffice, storeId, topupId) {
+function makeDepositCode(headOfficeId, storeId, topupId) {
   // 규칙: 본사ID-가맹점ID-충전요청ID
-  return `${headOffice
-  }-${storeId}-${topupId}`;
+  return `${headOfficeId}-${storeId}-${topupId}`;
 }
 
 function extractDepositCode(text) {
   if (!text) return null;
   const m = String(text).match(/\b(\d+)-(\d+)-(\d+)\b/);
   if (!m) return null;
-  return { headOffice: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
+  return { headOfficeId: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
 }
 
 function normalizeStatus(v, fallback = "ACTIVE") {
@@ -153,6 +153,7 @@ function parseIdFromFilename(filePath) {
   if (m) return Number(m[1]);
   return null;
 }
+
 // ----------------------------------------------------
 // Core: TOPUP 승인 처리(공통 함수)
 // ----------------------------------------------------
@@ -228,7 +229,7 @@ app.post("/auth/verify-head", async (req, res) => {
       [headOffice.id]
     );
 
-    res.json({ success: true, headOffices, branches: branchesRes.rows });
+    res.json({ success: true, headOffice, branches: branchesRes.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -282,15 +283,15 @@ app.post("/auth/login-store-by-code", async (req, res) => {
 // ----------------------------------------------------
 
 app.get("/products", async (req, res) => {
-  const { headOffice } = req.query;
-  if (!headOffice) {
-    return res.status(400).json({ success: false, error: "headOffice is required" });
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) {
+    return res.status(400).json({ success: false, error: "headOfficeId is required" });
   }
 
   try {
     const result = await pool.query(
       "SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC",
-      [headOffice]
+      [headOfficeId]
     );
 
     const base = getPublicBaseUrl(req);
@@ -313,8 +314,6 @@ app.get("/products", async (req, res) => {
   }
 });
 
-
-
 // ----------------------------------------------------
 // ORDERS (포인트 차감 포함)
 // ----------------------------------------------------
@@ -334,7 +333,7 @@ app.post("/orders", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "store 없음" });
     }
-    const headOffice = storeRes.rows[0].head_office_id;
+    const headOfficeId = storeRes.rows[0].head_office_id;
 
     const productIds = items.map((i) => i.productId);
     const productsRes = await client.query(
@@ -342,7 +341,7 @@ app.post("/orders", async (req, res) => {
        FROM products
        WHERE id = ANY($1::int[])
          AND head_office_id = $2`,
-      [productIds, headOffice]
+      [productIds, headOfficeId]
     );
 
     const priceMap = new Map(productsRes.rows.map((p) => [p.id, p.price]));
@@ -383,7 +382,7 @@ app.post("/orders", async (req, res) => {
       `INSERT INTO orders (store_id, head_office_id, status, total_amount)
        VALUES ($1, $2, 'pending', $3)
        RETURNING id`,
-      [storeId, headOffices, total]
+      [storeId, headOfficeId, total]
     );
     const orderId = orderRes.rows[0].id;
 
@@ -413,13 +412,14 @@ app.post("/orders", async (req, res) => {
   }
 });
 
+
 // 본사 주문목록
 app.get("/head/orders", async (req, res) => {
-  const { headOffices, status } = req.query;
-  if (!headOffices) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  const { headOfficeId, status } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
-    const params = [headOffices];
+    const params = [headOfficeId];
     let where = "WHERE o.head_office_id = $1";
     if (status) {
       params.push(status);
@@ -525,7 +525,7 @@ app.post("/topups/request", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "store 없음" });
     }
-    const head_offices = Number(s.rows[0].head_office_id);
+    const headOfficeId = Number(s.rows[0].head_office_id);
     const merchantCode = s.rows[0].merchant_code;
 
     // 1) 우선 requested 생성
@@ -540,7 +540,7 @@ app.post("/topups/request", async (req, res) => {
     const topupId = Number(r.rows[0].id);
 
     // 2) depositCode = 본사-가맹점-요청ID
-    const depositCode = makeDepositCode(headOffices, sid, topupId);
+    const depositCode = makeDepositCode(headOfficeId, sid, topupId);
 
     // 3) deposit_code 저장 + depositor_name도 depositCode로 맞춰두기(예상 입금자명)
     await client.query(
@@ -743,7 +743,7 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
     return res.json({ success: true, matched: false, message: "depositCode 파싱 실패(수동처리 필요)" });
   }
 
-  const depositCode = `${parsed.head_offices}-${parsed.storeId}-${parsed.topupId}`;
+  const depositCode = `${parsed.headOfficeId}-${parsed.storeId}-${parsed.topupId}`;
 
   const t = await pool.query(
     `SELECT id, store_id
@@ -781,7 +781,6 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
   return res.json({ success: true, matched: true, depositCode, ...result });
 });
 
-
 // ----------------------------------------------------
 // MASTER APIs (통합관리 시스템용)
 // ----------------------------------------------------
@@ -804,12 +803,149 @@ app.get("/master/head-offices", requireMaster, async (req, res) => {
   }
 });
 
-// (중간 코드 동일…)
+// ✅ 본사 추가 (본사코드 12자리 랜덤 자동 생성)
+app.post("/master/head-offices", requireMaster, async (req, res) => {
+  const { name, manager_name, address, phone } = req.body;
+  if (!name) return res.status(400).json({ success: false, message: "name 필요" });
+
+  try {
+    const code = await generateUniqueHeadOfficeCode();
+    const r = await pool.query(
+      `INSERT INTO head_offices (name, code, manager_name, address, phone)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, code, manager_name, address, phone`,
+      [name, code, manager_name ?? null, address ?? null, phone ?? null]
+    );
+    return res.status(201).json({ success: true, headOffice: r.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 본사 수정
+app.patch("/master/head-offices/:id", requireMaster, async (req, res) => {
+  const id = Number(req.params.id);
+  const { name, manager_name, address, phone } = req.body;
+
+  try {
+    const r = await pool.query(
+      `UPDATE head_offices
+       SET name = COALESCE($2, name),
+           manager_name = COALESCE($3, manager_name),
+           address = COALESCE($4, address),
+           phone = COALESCE($5, phone)
+       WHERE id = $1
+       RETURNING id, name, code, manager_name, address, phone`,
+      [id, name ?? null, manager_name ?? null, address ?? null, phone ?? null]
+    );
+    if (!r.rowCount) return res.status(404).json({ success: false, message: "본사 없음" });
+    res.json({ success: true, headOffice: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 본사 삭제
+app.delete("/master/head-offices/:id", requireMaster, async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const r = await pool.query(`DELETE FROM head_offices WHERE id=$1`, [id]);
+    if (!r.rowCount) return res.status(404).json({ success: false, message: "본사 없음" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 가맹점 목록 (본사별)
+app.get("/master/stores", requireMaster, async (req, res) => {
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+
+  try {
+    const r = await pool.query(
+      `SELECT id, head_office_id, name, address, phone, status, merchant_code,
+              to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
+       FROM stores
+       WHERE head_office_id=$1
+       ORDER BY id DESC`,
+      [headOfficeId]
+    );
+    res.json({ success: true, stores: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 가맹점 추가 (merchant_code 서버에서 자동 생성)
+app.post("/master/stores", requireMaster, async (req, res) => {
+  const { headOfficeId, name, address, phone, status } = req.body;
+
+  if (!headOfficeId || !name) {
+    return res.status(400).json({ success: false, message: "headOfficeId/name 필요" });
+  }
+
+  try {
+    const merchantCode = await generateUniqueMerchantCode();
+
+    const r = await pool.query(
+      `INSERT INTO stores(head_office_id, name, merchant_code, address, phone, status)
+       VALUES($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [Number(headOfficeId), String(name).trim(), merchantCode, address || null, phone || null, status || "ACTIVE"]
+    );
+
+    res.json({ success: true, store: r.rows[0] });
+  } catch (err) {
+    if (String(err.message || "").includes("merchant_code")) {
+      return res.status(409).json({ success: false, message: "가맹점 코드 생성 충돌. 다시 시도하세요." });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ✅ 가맹점 엑셀 업로드 (본사코드 기준, merchant_code 자동 생성)
+app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
+
+  const rows = readExcel(req.file.buffer);
+  const result = { inserted: 0, failed: [] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      const headOfficeCode = String(row.head_office_code || row.본사코드 || "").trim();
+      const storeName = String(row.store_name || row.가맹점명 || "").trim();
+      const address = String(row.address || row.주소 || "").trim() || null;
+      const phone = String(row.phone || row.연락처 || "").trim() || null;
+      const status = normalizeStatus(row.status || row.상태 || "ACTIVE", "ACTIVE");
+
+      if (!headOfficeCode || !storeName) throw new Error("head_office_code/store_name 필수");
+
+      const h = await pool.query("SELECT id FROM head_offices WHERE code=$1", [headOfficeCode]);
+      if (h.rowCount === 0) throw new Error(`본사코드 없음: ${headOfficeCode}`);
+
+      const merchantCode = await generateUniqueMerchantCode();
+
+      await pool.query(
+        `INSERT INTO stores(head_office_id, name, merchant_code, address, phone, status)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [h.rows[0].id, storeName, merchantCode, address, phone, status]
+      );
+
+      result.inserted++;
+    } catch (e) {
+      result.failed.push({ rowIndex: i + 2, error: e.message });
+    }
+  }
+
+  res.json({ success: true, ...result });
+});
 
 // ✅ 상품 목록 (본사 선택 후)
 app.get("/master/products", requireMaster, async (req, res) => {
-  const { headOffices } = req.query;
-  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
     const r = await pool.query(
@@ -818,7 +954,7 @@ app.get("/master/products", requireMaster, async (req, res) => {
        FROM products
        WHERE head_office_id=$1
        ORDER BY id DESC`,
-      [headOffices]
+      [headOfficeId]
     );
 
     const base = getPublicBaseUrl(req);
@@ -893,11 +1029,11 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 // ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
 // ----------------------------------------------------
 app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
-  const { headOffices } = req.query;
-  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
+  const { headOfficeId } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
   if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
 
-  const hid = Number(headOffices);
+  const hid = Number(headOfficeId);
   const MAX_ZIP_BYTES = 120 * 1024 * 1024; // 120MB
   if (req.file.size > MAX_ZIP_BYTES) {
     return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
@@ -924,7 +1060,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 
   const report = {
     success: true,
-    headOffices: hid,
+    headOfficeId: hid,
     sheet: sheetEntry.path,
     products: { inserted: 0, updated: 0, failed: [], createdIds: [] },
     images: { updated: 0, skipped: [] },
@@ -1034,7 +1170,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
       }
 
       if (!latestIdToName.has(productId)) {
-        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOffices` });
+        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
         continue;
       }
 
@@ -1097,7 +1233,7 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 
   const dir = path.join(productImagesRoot, String(hid));
   const report = {
-    headOffices: hid,
+    headOfficeId: hid,
     dryRun: isDryRun,
     scanned: products.length,
     migrated: [],
@@ -1214,10 +1350,10 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 }
 
 app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
-  const { headOffices, dryRun } = req.query;
-  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
+  const { headOfficeId, dryRun } = req.query;
+  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
-  const hid = Number(headOffices);
+  const hid = Number(headOfficeId);
   const isDryRun = String(dryRun || "").toLowerCase() === "true";
 
   try {
