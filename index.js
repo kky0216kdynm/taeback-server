@@ -1657,9 +1657,10 @@ if (
 }
 
 // SPA 라우팅 (API 경로 제외)
-app.get(/^\/(?!auth|products|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
+app.get(/^\/(?!auth|products|product-images|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
 });
+  
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
