@@ -55,16 +55,17 @@ function requireMaster(req, res, next) {
 // ----------------------------------------------------
 // Utils
 // ----------------------------------------------------
-function makeDepositCode(headOfficeId, storeId, topupId) {
+function makeDepositCode(headOffice, storeId, topupId) {
   // 규칙: 본사ID-가맹점ID-충전요청ID
-  return `${headOfficeId}-${storeId}-${topupId}`;
+  return `${headOffice
+  }-${storeId}-${topupId}`;
 }
 
 function extractDepositCode(text) {
   if (!text) return null;
   const m = String(text).match(/\b(\d+)-(\d+)-(\d+)\b/);
   if (!m) return null;
-  return { headOfficeId: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
+  return { headOffice: Number(m[1]), storeId: Number(m[2]), topupId: Number(m[3]) };
 }
 
 function normalizeStatus(v, fallback = "ACTIVE") {
@@ -227,7 +228,7 @@ app.post("/auth/verify-head", async (req, res) => {
       [headOffice.id]
     );
 
-    res.json({ success: true, headOffice, branches: branchesRes.rows });
+    res.json({ success: true, headOffices, branches: branchesRes.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -281,15 +282,15 @@ app.post("/auth/login-store-by-code", async (req, res) => {
 // ----------------------------------------------------
 
 app.get("/products", async (req, res) => {
-  const { headOfficeId } = req.query;
-  if (!headOfficeId) {
-    return res.status(400).json({ success: false, error: "headOfficeId is required" });
+  const { headOffice } = req.query;
+  if (!headOffice) {
+    return res.status(400).json({ success: false, error: "headOffice is required" });
   }
 
   try {
     const result = await pool.query(
       "SELECT * FROM products WHERE head_office_id = $1 ORDER BY id DESC",
-      [headOfficeId]
+      [headOffice]
     );
 
     const base = getPublicBaseUrl(req);
@@ -333,7 +334,7 @@ app.post("/orders", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "store 없음" });
     }
-    const headOfficeId = storeRes.rows[0].head_office_id;
+    const headOffice = storeRes.rows[0].head_office_id;
 
     const productIds = items.map((i) => i.productId);
     const productsRes = await client.query(
@@ -341,7 +342,7 @@ app.post("/orders", async (req, res) => {
        FROM products
        WHERE id = ANY($1::int[])
          AND head_office_id = $2`,
-      [productIds, headOfficeId]
+      [productIds, headOffice]
     );
 
     const priceMap = new Map(productsRes.rows.map((p) => [p.id, p.price]));
@@ -382,7 +383,7 @@ app.post("/orders", async (req, res) => {
       `INSERT INTO orders (store_id, head_office_id, status, total_amount)
        VALUES ($1, $2, 'pending', $3)
        RETURNING id`,
-      [storeId, headOfficeId, total]
+      [storeId, headOffices, total]
     );
     const orderId = orderRes.rows[0].id;
 
@@ -414,11 +415,11 @@ app.post("/orders", async (req, res) => {
 
 // 본사 주문목록
 app.get("/head/orders", async (req, res) => {
-  const { headOfficeId, status } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  const { headOffices, status } = req.query;
+  if (!headOffices) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
 
   try {
-    const params = [headOfficeId];
+    const params = [headOffices];
     let where = "WHERE o.head_office_id = $1";
     if (status) {
       params.push(status);
@@ -524,7 +525,7 @@ app.post("/topups/request", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "store 없음" });
     }
-    const headOfficeId = Number(s.rows[0].head_office_id);
+    const head_offices = Number(s.rows[0].head_office_id);
     const merchantCode = s.rows[0].merchant_code;
 
     // 1) 우선 requested 생성
@@ -539,7 +540,7 @@ app.post("/topups/request", async (req, res) => {
     const topupId = Number(r.rows[0].id);
 
     // 2) depositCode = 본사-가맹점-요청ID
-    const depositCode = makeDepositCode(headOfficeId, sid, topupId);
+    const depositCode = makeDepositCode(headOffices, sid, topupId);
 
     // 3) deposit_code 저장 + depositor_name도 depositCode로 맞춰두기(예상 입금자명)
     await client.query(
@@ -742,7 +743,7 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
     return res.json({ success: true, matched: false, message: "depositCode 파싱 실패(수동처리 필요)" });
   }
 
-  const depositCode = `${parsed.headOfficeId}-${parsed.storeId}-${parsed.topupId}`;
+  const depositCode = `${parsed.head_offices}-${parsed.storeId}-${parsed.topupId}`;
 
   const t = await pool.query(
     `SELECT id, store_id
@@ -807,8 +808,8 @@ app.get("/master/head-offices", requireMaster, async (req, res) => {
 
 // ✅ 상품 목록 (본사 선택 후)
 app.get("/master/products", requireMaster, async (req, res) => {
-  const { headOfficeId } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  const { headOffices } = req.query;
+  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
 
   try {
     const r = await pool.query(
@@ -817,7 +818,7 @@ app.get("/master/products", requireMaster, async (req, res) => {
        FROM products
        WHERE head_office_id=$1
        ORDER BY id DESC`,
-      [headOfficeId]
+      [headOffices]
     );
 
     const base = getPublicBaseUrl(req);
@@ -892,11 +893,11 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 // ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
 // ----------------------------------------------------
 app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
-  const { headOfficeId } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  const { headOffices } = req.query;
+  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
   if (!req.file) return res.status(400).json({ success: false, message: "file(zip) 필요" });
 
-  const hid = Number(headOfficeId);
+  const hid = Number(headOffices);
   const MAX_ZIP_BYTES = 120 * 1024 * 1024; // 120MB
   if (req.file.size > MAX_ZIP_BYTES) {
     return res.status(400).json({ success: false, message: "ZIP 파일이 너무 큽니다 (120MB 제한)" });
@@ -923,7 +924,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 
   const report = {
     success: true,
-    headOfficeId: hid,
+    headOffices: hid,
     sheet: sheetEntry.path,
     products: { inserted: 0, updated: 0, failed: [], createdIds: [] },
     images: { updated: 0, skipped: [] },
@@ -1033,7 +1034,7 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
       }
 
       if (!latestIdToName.has(productId)) {
-        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
+        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOffices` });
         continue;
       }
 
@@ -1096,7 +1097,7 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 
   const dir = path.join(productImagesRoot, String(hid));
   const report = {
-    headOfficeId: hid,
+    headOffices: hid,
     dryRun: isDryRun,
     scanned: products.length,
     migrated: [],
@@ -1213,10 +1214,10 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 }
 
 app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
-  const { headOfficeId, dryRun } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
+  const { headOffices, dryRun } = req.query;
+  if (!headOffices) return res.status(400).json({ success: false, message: "headOffices 필요" });
 
-  const hid = Number(headOfficeId);
+  const hid = Number(headOffices);
   const isDryRun = String(dryRun || "").toLowerCase() === "true";
 
   try {
