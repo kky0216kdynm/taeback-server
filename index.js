@@ -1525,10 +1525,11 @@ app.get("/__whoami", (req, res) => {
   res.json({
     ok: true,
     service: "taeback-api",
-    rev: APP_REV,
+    rev: process.env.APP_REV || "no-rev",
     time: new Date().toISOString(),
   });
 });
+
 
 // ✅ R2 image redirect (반드시 static/spa보다 위)
 app.get("/product-images/:rest(*)", (req, res) => {
