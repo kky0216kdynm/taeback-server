@@ -94,6 +94,65 @@ function requireMaster(req, res, next) {
 // ----------------------------------------------------
 // Utils
 // ----------------------------------------------------
+
+function isJpeg(buf) {
+  return buf && buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+}
+function isPng(buf) {
+  return (
+    buf &&
+    buf.length >= 8 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  );
+}
+function isWebp(buf) {
+  return (
+    buf &&
+    buf.length >= 12 &&
+    buf[0] === 0x52 && // R
+    buf[1] === 0x49 && // I
+    buf[2] === 0x46 && // F
+    buf[3] === 0x46 && // F
+    buf[8] === 0x57 && // W
+    buf[9] === 0x45 && // E
+    buf[10] === 0x42 && // B
+    buf[11] === 0x50 // P
+  );
+}
+
+function isProbablyImage(buf, ext) {
+  if (!buf) return false;
+  if (buf.length < 1024) return false; // ✅ 1KB 미만은 거의 다 쓰레기/메타파일
+  switch (ext) {
+    case ".jpg":
+    case ".jpeg":
+      return isJpeg(buf);
+    case ".png":
+      return isPng(buf);
+    case ".webp":
+      return isWebp(buf);
+    default:
+      return false;
+  }
+}
+
+function isMacJunkPath(p) {
+  const s = String(p || "");
+  const base = path.basename(s);
+  // ✅ __MACOSX 폴더, ._ 리소스 포크, DS_Store 제외
+  if (s.includes("__MACOSX/") || s.includes("__MACOSX\\")) return true;
+  if (base.startsWith("._")) return true;
+  if (base === ".DS_Store") return true;
+  return false;
+}
+
 function makeDepositCode(headOfficeId, storeId, topupId) {
   return `${headOfficeId}-${storeId}-${topupId}`;
 }
@@ -1175,9 +1234,12 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
   const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
   const imageEntries = directory.files.filter((f) => {
     if (f.type !== "File") return false;
+    if (isMacJunkPath(f.path)) return false; // ✅ 맥 쓰레기 파일 제거
     const ext = path.extname(f.path || "").toLowerCase();
-    return allowedExt.has(ext);
+    if (!allowedExt.has(ext)) return false;
+    return true;
   });
+  
 
   for (const f of imageEntries) {
     try {
@@ -1209,6 +1271,16 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
 
       const objectKey = `product-images/${hid}/p${productId}${ext}`;
       const buf = await f.buffer();
+
+// ✅ 진짜 이미지인지 검증 (가짜 jpg 업로드 방지)
+      if (!isProbablyImage(buf, ext)) {
+      report.images.skipped.push({
+      file: f.path,
+      reason: "not a valid image (mac junk or corrupted)",
+      size: buf?.length || 0,});
+      continue;}
+
+
 
       await uploadToR2({
         key: objectKey,
