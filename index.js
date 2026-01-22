@@ -1,3 +1,11 @@
+console.log("BOOT START", {
+  node: process.version,
+  express: require("express/package.json").version,
+  port: process.env.PORT
+});
+console.log("LISTENING...");
+
+
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -1423,4 +1431,6 @@ app.get(
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT} (rev=${APP_REV})`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 server listening on ${PORT}`);
+});
