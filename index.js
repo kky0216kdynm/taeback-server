@@ -12,6 +12,7 @@ const crypto = require("crypto");
 
 const multer = require("multer");
 const xlsx = require("xlsx");
+
 const upload = multer({ storage: multer.memoryStorage() });
 const uploadAny = multer({ storage: multer.memoryStorage() }).any();
 
@@ -20,20 +21,15 @@ const APP_REV = process.env.APP_REV || "dev";
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ----------------------------------------------------
+// R2 (Cloudflare R2 via S3 API)
+// ----------------------------------------------------
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
 const R2_BUCKET = process.env.R2_BUCKET || "taeback-product-images";
 const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/$/, "");
-
-app.get("/product-images/:rest(*)", (req, res) => {
-  if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
-  const rest = req.params.rest; // "6/p75.jpg"
-  return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${rest}`);
-});
-
-
-
 
 const r2 = new S3Client({
   region: "auto",
@@ -44,13 +40,19 @@ const r2 = new S3Client({
   },
 });
 
+// ✅ product-images: API에서 R2 public로 리다이렉트 (단일 정의)
+app.get("/product-images/:rest(*)", (req, res) => {
+  if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
+  const rest = req.params.rest; // e.g. "6/p101.jpg"
+  return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${rest}`);
+});
 
 // ----------------------------------------------------
 // DB
 // ----------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false, // 운영에서 SSL 필요하면 { rejectUnauthorized:false } 고려
+  ssl: false,
 });
 
 // ✅ DB 세션 타임존을 KST로 고정
@@ -85,7 +87,6 @@ function requireMaster(req, res, next) {
 // Utils
 // ----------------------------------------------------
 function makeDepositCode(headOfficeId, storeId, topupId) {
-  // 규칙: 본사ID-가맹점ID-충전요청ID
   return `${headOfficeId}-${storeId}-${topupId}`;
 }
 
@@ -105,16 +106,14 @@ function normalizeStatus(v, fallback = "ACTIVE") {
   return fallback;
 }
 
-// ✅ 12자리 영문+숫자 랜덤 (혼동문자 제거)
 function generateSecureCode12() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // I,O,0,1 제거
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const bytes = crypto.randomBytes(12);
   let out = "";
   for (let i = 0; i < 12; i++) out += chars[bytes[i] % chars.length];
   return out;
 }
 
-// ✅ stores.merchant_code 유니크 보장 생성
 async function generateUniqueMerchantCode() {
   for (let i = 0; i < 50; i++) {
     const code = generateSecureCode12();
@@ -124,7 +123,6 @@ async function generateUniqueMerchantCode() {
   return generateSecureCode12();
 }
 
-// ✅ head_offices.code 유니크 보장 생성
 async function generateUniqueHeadOfficeCode() {
   for (let i = 0; i < 50; i++) {
     const code = generateSecureCode12();
@@ -137,7 +135,6 @@ async function generateUniqueHeadOfficeCode() {
 function readExcel(buffer, filename = "") {
   const name = String(filename || "").toLowerCase().trim();
 
-  // CSV는 문자열로 읽는 게 안전
   if (name.endsWith(".csv")) {
     const csvText = buffer.toString("utf8");
     const wb = xlsx.read(csvText, { type: "string" });
@@ -146,7 +143,6 @@ function readExcel(buffer, filename = "") {
     return xlsx.utils.sheet_to_json(sheet, { defval: "" });
   }
 
-  // xlsx/xls는 buffer로
   const wb = xlsx.read(buffer, { type: "buffer" });
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
@@ -171,7 +167,6 @@ function getPublicBaseUrl(req) {
   return `${proto}://${req.get("host")}`;
 }
 
-// ✅ [추가] 파일명이 숫자(id)인지 파싱 (images/12.jpg 또는 images/p12.jpg)
 function parseIdFromFilename(filePath) {
   const base = path.basename(filePath || "");
   const ext = path.extname(base);
@@ -240,8 +235,6 @@ async function applyTopupPaid({ topupId, memo = "입금확인 충전", refType =
 // ----------------------------------------------------
 // AUTH
 // ----------------------------------------------------
-
-// 1) 본사 인증
 app.post("/auth/verify-head", async (req, res) => {
   const { inviteCode } = req.body;
   try {
@@ -263,7 +256,6 @@ app.post("/auth/verify-head", async (req, res) => {
   }
 });
 
-// 2) 가맹점 로그인(지점id+가맹코드)
 app.post("/auth/login-store", async (req, res) => {
   const { storeId, merchantCode } = req.body;
   try {
@@ -282,7 +274,6 @@ app.post("/auth/login-store", async (req, res) => {
   }
 });
 
-// 3) 가맹점 코드만으로 로그인
 app.post("/auth/login-store-by-code", async (req, res) => {
   const { merchantCode } = req.body;
 
@@ -309,7 +300,6 @@ app.post("/auth/login-store-by-code", async (req, res) => {
 // ----------------------------------------------------
 // PRODUCTS (가맹점/본사 웹에서 사용)
 // ----------------------------------------------------
-
 app.get("/products", async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) {
@@ -331,8 +321,8 @@ app.get("/products", async (req, res) => {
 
       return {
         ...p,
-        image_url: abs, // 웹이 쓰던 필드 유지
-        imageUrl: abs,  // iOS가 쓰기 쉬운 필드
+        image_url: abs,
+        imageUrl: abs,
       };
     });
 
@@ -440,8 +430,6 @@ app.post("/orders", async (req, res) => {
   }
 });
 
-
-// 본사 주문목록
 app.get("/head/orders", async (req, res) => {
   const { headOfficeId, status } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
@@ -474,7 +462,6 @@ app.get("/head/orders", async (req, res) => {
   }
 });
 
-// 본사 주문상세
 app.get("/head/orders/:orderId", async (req, res) => {
   const { orderId } = req.params;
 
@@ -533,9 +520,8 @@ app.get("/wallet", async (req, res) => {
   }
 });
 
-// ✅ 포인트 충전 요청 생성 + deposit_code 생성/저장/반환
 app.post("/topups/request", async (req, res) => {
-  const { storeId, amount } = req.body; // depositorName 제거
+  const { storeId, amount } = req.body;
 
   const sid = Number(storeId);
   const amt = Number(amount);
@@ -556,7 +542,6 @@ app.post("/topups/request", async (req, res) => {
     const headOfficeId = Number(s.rows[0].head_office_id);
     const merchantCode = s.rows[0].merchant_code;
 
-    // 1) 우선 requested 생성
     const r = await client.query(
       `INSERT INTO point_topups (store_id, amount, depositor_name, status)
        VALUES ($1, $2, NULL, 'requested')
@@ -566,11 +551,8 @@ app.post("/topups/request", async (req, res) => {
     );
 
     const topupId = Number(r.rows[0].id);
-
-    // 2) depositCode = 본사-가맹점-요청ID
     const depositCode = makeDepositCode(headOfficeId, sid, topupId);
 
-    // 3) deposit_code 저장 + depositor_name도 depositCode로 맞춰두기(예상 입금자명)
     await client.query(
       "UPDATE point_topups SET deposit_code=$1, depositor_name=$2 WHERE id=$3",
       [depositCode, depositCode, topupId]
@@ -578,23 +560,22 @@ app.post("/topups/request", async (req, res) => {
 
     await client.query("COMMIT");
 
-    // ✅ UX용 안내: 입금자명은 depositCode를 ‘그대로’ 사용하게 만들기
     const depositGuide = {
       bank: DEPOSIT.bank,
       account: DEPOSIT.account,
       holder: DEPOSIT.holder,
       depositCode,
-      depositorNameToUse: depositCode,                 // ★ 핵심
-      depositorRule: `입금자명(필수): ${depositCode}`,   // ★ 핵심
+      depositorNameToUse: depositCode,
+      depositorRule: `입금자명(필수): ${depositCode}`,
       memoRule: `받는통장표시(메모)에도 가능하면 ${depositCode} 입력`,
       fallbackDepositorRule: `입금자명이 막히면(길이제한 등) 대신: ${merchantCode}`,
-      topupId, // 앱이 바로 보여줄 수 있도록
+      topupId,
     };
 
     return res.json({
       success: true,
       topup: { ...r.rows[0], deposit_code: depositCode, depositor_name: depositCode },
-      depositGuide
+      depositGuide,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -624,7 +605,6 @@ app.get("/topups/:id", async (req, res) => {
   }
 });
 
-
 app.get("/topups", async (req, res) => {
   const storeId = Number(req.query.storeId);
   if (!storeId) return res.status(400).json({ success: false, message: "storeId 필요" });
@@ -648,7 +628,6 @@ app.get("/topups", async (req, res) => {
   }
 });
 
-// 마스터: 충전 승인(수동)
 app.post("/admin/topups/:id/mark-paid", requireMaster, async (req, res) => {
   const topupId = Number(req.params.id);
   if (!topupId) return res.status(400).json({ success: false, message: "topupId 필요" });
@@ -748,7 +727,7 @@ app.post("/profile/upsert", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// ✅ MOCK BANK (운영 전 테스트용)
+// ✅ MOCK BANK
 // ----------------------------------------------------
 app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
   const { txId, amount, memo, depositor, occurredAt } = req.body;
@@ -810,10 +789,8 @@ app.post("/admin/bank/mock-incoming", requireMaster, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// MASTER APIs (통합관리 시스템용)
+// MASTER APIs
 // ----------------------------------------------------
-
-// ✅ 본사 목록 (+ 가맹점 수 포함)
 app.get("/master/head-offices", requireMaster, async (req, res) => {
   try {
     const r = await pool.query(`
@@ -831,7 +808,6 @@ app.get("/master/head-offices", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 본사 추가 (본사코드 12자리 랜덤 자동 생성)
 app.post("/master/head-offices", requireMaster, async (req, res) => {
   const { name, manager_name, address, phone } = req.body;
   if (!name) return res.status(400).json({ success: false, message: "name 필요" });
@@ -850,7 +826,6 @@ app.post("/master/head-offices", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 본사 수정
 app.patch("/master/head-offices/:id", requireMaster, async (req, res) => {
   const id = Number(req.params.id);
   const { name, manager_name, address, phone } = req.body;
@@ -873,7 +848,6 @@ app.patch("/master/head-offices/:id", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 본사 삭제
 app.delete("/master/head-offices/:id", requireMaster, async (req, res) => {
   const id = Number(req.params.id);
   try {
@@ -885,7 +859,6 @@ app.delete("/master/head-offices/:id", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 가맹점 목록 (본사별)
 app.get("/master/stores", requireMaster, async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
@@ -905,7 +878,6 @@ app.get("/master/stores", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 가맹점 추가 (merchant_code 서버에서 자동 생성)
 app.post("/master/stores", requireMaster, async (req, res) => {
   const { headOfficeId, name, address, phone, status } = req.body;
 
@@ -932,7 +904,6 @@ app.post("/master/stores", requireMaster, async (req, res) => {
   }
 });
 
-// ✅ 가맹점 엑셀 업로드 (본사코드 기준, merchant_code 자동 생성)
 app.post("/master/stores/upload", requireMaster, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "file 필요" });
 
@@ -970,7 +941,7 @@ app.post("/master/stores/upload", requireMaster, upload.single("file"), async (r
   res.json({ success: true, ...result });
 });
 
-// ✅ 상품 목록 (본사 선택 후)
+// ✅ master 상품 목록 (단일 정의)
 app.get("/master/products", requireMaster, async (req, res) => {
   const { headOfficeId } = req.query;
   if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
@@ -982,7 +953,7 @@ app.get("/master/products", requireMaster, async (req, res) => {
        FROM products
        WHERE head_office_id=$1
        ORDER BY id DESC`,
-      [headOfficeId]
+      [Number(headOfficeId)]
     );
 
     const base = getPublicBaseUrl(req);
@@ -993,68 +964,30 @@ app.get("/master/products", requireMaster, async (req, res) => {
       return { ...p, image_url: abs, imageUrl: abs };
     });
 
-    // ✅ [수정] r.rows가 아니라 products를 내려야 함
     res.json({ success: true, products });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ✅ 상품 품절 토글 (재고 없이 status만: ACTIVE / SOLD_OUT)
 app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
+
   try {
-    const r = await pool.query("UPDATE products SET status=$1 WHERE id=$2 RETURNING *", [
-      normalizeStatus(status, "ACTIVE"),
-      id,
-    ]);
+    const r = await pool.query(
+      "UPDATE products SET status=$1, updated_at=now() WHERE id=$2 RETURNING *",
+      [normalizeStatus(status, "ACTIVE"), Number(id)]
+    );
     res.json({ success: true, product: r.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ✅ 상품 엑셀 업로드 (본사코드 기준)
-app.post("/master/products/upload", requireMaster, uploadAny, async (req, res) => {
-  const { headOfficeId } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
-
-  const file = (req.files && req.files[0]) || null;
-  if (!file) return res.status(400).json({ success: false, message: "file 필요 (FormData key가 file이 아닐 수도 있음)" });
-
-  const hid = Number(headOfficeId);
-  const rows = readExcel(file.buffer, file.originalname);
-
-  const result = { inserted: 0, failed: [] };
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    try {
-      const name = String(row.name ?? row.상품명 ?? "").trim();
-      const category = String(row.category ?? row.카테고리 ?? "").trim() || null;
-      const price = Number(row.price ?? row.가격);
-      const status = normalizeStatus(row.status ?? row.상태 ?? "ACTIVE", "ACTIVE");
-
-      if (!name) throw new Error("name(상품명) 필수");
-      if (Number.isNaN(price)) throw new Error("price(가격) 필수(숫자)");
-
-      await pool.query(
-        `INSERT INTO products(head_office_id, name, category, price, status)
-         VALUES($1,$2,$3,$4,$5)`,
-        [hid, name, category, price, status]
-      );
-
-      result.inserted++;
-    } catch (e) {
-      result.failed.push({ rowIndex: i + 2, error: e.message });
-    }
-  }
-
-  res.json({ success: true, ...result });
-});
-
-//업로드 헬퍼 이미지 호스팅
+// ----------------------------------------------------
+// 업로드 헬퍼
+// ----------------------------------------------------
 function guessContentTypeByExt(ext) {
   switch (ext) {
     case ".jpg":
@@ -1078,70 +1011,11 @@ async function uploadToR2({ key, body, contentType }) {
       ContentType: contentType,
     })
   );
-  // ✅ 여기서는 URL을 반환하지 말고 업로드만 책임지게 두는게 안전
   return true;
-};
-
-
-// ----------------------------------------------------
-// Static for product images  ✅ (라우트보다 위에 있어야 함)
-// ----------------------------------------------------
-const productImagesRoot = path.join(__dirname, "public", "product-images");
-
+}
 
 // ----------------------------------------------------
-// ✅ 상품 목록 (본사 선택 후)
-// ----------------------------------------------------
-app.get("/master/products", requireMaster, async (req, res) => {
-  const { headOfficeId } = req.query;
-  if (!headOfficeId) return res.status(400).json({ success: false, message: "headOfficeId 필요" });
-
-  try {
-    const r = await pool.query(
-      `SELECT id, head_office_id, name, category, price, image_url, status,
-              to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
-       FROM products
-       WHERE head_office_id=$1
-       ORDER BY id DESC`,
-      [Number(headOfficeId)]
-    );
-
-    const base = getPublicBaseUrl(req);
-    const products = r.rows.map((p) => {
-      const abs = p.image_url
-        ? (p.image_url.startsWith("http") ? p.image_url : `${base}${p.image_url}`)
-        : null;
-      return { ...p, image_url: abs, imageUrl: abs };
-    });
-
-    res.json({ success: true, products });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ----------------------------------------------------
-// ✅ 상품 품절 토글 (status만: ACTIVE / SOLD_OUT / INACTIVE)
-// ----------------------------------------------------
-app.patch("/master/products/:id/status", requireMaster, async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-
-  try {
-    const r = await pool.query(
-      "UPDATE products SET status=$1, updated_at=now() WHERE id=$2 RETURNING *",
-      [normalizeStatus(status, "ACTIVE"), Number(id)]
-    );
-    res.json({ success: true, product: r.rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ----------------------------------------------------
-// ✅ 상품 엑셀 업로드 (✅ headOfficeId로만 업로드 / head_office_code 제거)
-//   - Query: /master/products/upload?headOfficeId=4
-//   - 파일 컬럼: name, category, price, status
+// ✅ 상품 엑셀 업로드
 // ----------------------------------------------------
 app.post("/master/products/upload", requireMaster, upload.single("file"), async (req, res) => {
   const { headOfficeId } = req.query;
@@ -1179,10 +1053,7 @@ app.post("/master/products/upload", requireMaster, upload.single("file"), async 
 });
 
 // ----------------------------------------------------
-// ✅ ZIP 업로드 (id 우선 매칭 + 이미지 p{id}.ext 저장)
-//   - Query: /master/products/batch-zip?headOfficeId=4
-//   - ZIP 내부: (csv/xlsx/xls 1개) + (이미지들)
-//   - 이미지 파일명: 12.jpg / p12.jpg / 삼겹살.jpg(이름매칭 fallback)
+// ✅ ZIP 배치 업로드 (엑셀 + 이미지)
 // ----------------------------------------------------
 app.post("/master/products/batch-zip", requireMaster, upload.single("file"), async (req, res) => {
   const { headOfficeId } = req.query;
@@ -1203,7 +1074,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     return res.status(400).json({ success: false, message: "ZIP 열기 실패", error: e.message });
   }
 
-  // 1) ZIP 안의 엑셀/CSV 찾기
   const sheetEntry = directory.files.find((f) => {
     if (f.type !== "File") return false;
     const p = (f.path || "").toLowerCase();
@@ -1224,11 +1094,9 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     images: { updated: 0, skipped: [] },
   };
 
-  // 2) 기존 상품 맵
   const existing = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
   const nameToId = new Map(existing.rows.map((p) => [p.name, p.id]));
 
-  // 3) 시트로 상품 upsert(이름 기준 + id 있으면 우선)
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     try {
@@ -1285,10 +1153,9 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     }
   }
 
-  // 4) 최신 상품 다시 로드해서 "이름 매칭 fallback" 만들기
   const latest = await pool.query("SELECT id, name FROM products WHERE head_office_id=$1", [hid]);
 
-  const latestIdToName = new Set(latest.rows.map((p) => p.id));
+  const latestIdSet = new Set(latest.rows.map((p) => p.id));
   const latestNameKeyToIds = new Map();
   for (const p of latest.rows) {
     const k = normalizeNameForMatch(p.name);
@@ -1297,7 +1164,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     latestNameKeyToIds.set(k, arr);
   }
 
-  // 5) ZIP 안의 이미지 엔트리
   const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
   const imageEntries = directory.files.filter((f) => {
     if (f.type !== "File") return false;
@@ -1305,7 +1171,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
     return allowedExt.has(ext);
   });
 
-  // 6) 이미지 업로드 + DB 업데이트 (DB는 상대경로 유지!)
   for (const f of imageEntries) {
     try {
       const ext = path.extname(f.path || "").toLowerCase();
@@ -1329,14 +1194,12 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
         productId = ids[0];
       }
 
-      if (!latestIdToName.has(productId)) {
+      if (!latestIdSet.has(productId)) {
         report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
         continue;
       }
 
-      // ✅ R2 object key (R2에서 실제 경로)
       const objectKey = `product-images/${hid}/p${productId}${ext}`;
-
       const buf = await f.buffer();
 
       await uploadToR2({
@@ -1345,7 +1208,6 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
         contentType: guessContentTypeByExt(ext),
       });
 
-      // ✅ DB에는 상대경로로 저장 (기존 프론트 호환)
       const relUrl = `/product-images/${hid}/p${productId}${ext}`;
 
       await pool.query(
@@ -1363,11 +1225,11 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
   res.json(report);
 });
 
-
-
 // ----------------------------------------------------
-// ✅ [추가] 기존 한글 파일명 이미지 자동 마이그레이션 (1회 실행용)
+// ✅ 이미지 마이그레이션 (로컬 파일 기반) - 필요시 유지
 // ----------------------------------------------------
+const productImagesRoot = path.join(__dirname, "public", "product-images");
+
 async function fileExists(p) {
   try {
     await fsp.access(p, fs.constants.F_OK);
@@ -1376,9 +1238,11 @@ async function fileExists(p) {
     return false;
   }
 }
+
 function getExtFromPath(p) {
   return path.extname(p || "").toLowerCase();
 }
+
 function isAllowedImageExt(ext) {
   return [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
 }
@@ -1408,7 +1272,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 
   const files = await fsp.readdir(dir);
 
-  // nameKey -> [filename...]
   const nameKeyToFiles = new Map();
   for (const f of files) {
     const ext = getExtFromPath(f);
@@ -1423,7 +1286,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
   for (const p of products) {
     const productId = p.id;
 
-    // 이미 p{id}.ext가 있으면 DB만 보정하고 스킵
     const already = files.find((f) => {
       const ext = getExtFromPath(f);
       if (!isAllowedImageExt(ext)) return false;
@@ -1444,7 +1306,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
       continue;
     }
 
-    // DB image_url 파일 우선
     let srcFile = null;
     if (p.image_url) {
       const u = String(p.image_url);
@@ -1454,7 +1315,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
       if (baseName && (await fileExists(path.join(dir, baseName)))) srcFile = baseName;
     }
 
-    // 없으면 name으로 찾기
     if (!srcFile) {
       const key = normalizeNameForMatch(p.name);
       const candidates = nameKeyToFiles.get(key) || [];
@@ -1500,10 +1360,6 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 
   return report;
 }
-app.get("/__revcheck_20260122", (req, res) => {
-  res.send("ok-20260122");
-});
-
 
 app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
   const { headOfficeId, dryRun } = req.query;
@@ -1520,7 +1376,12 @@ app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
   }
 });
 
-
+// ----------------------------------------------------
+// ✅ REV CHECK (배포 확인용)
+// ----------------------------------------------------
+app.get("/__revcheck_20260122", (req, res) => {
+  res.send("ok-20260122");
+});
 
 // ----------------------------------------------------
 // Health Check
@@ -1534,16 +1395,8 @@ app.get("/__whoami", (req, res) => {
   });
 });
 
-
-app.get("/product-images/:rest(.*)", (req, res) => {
-  if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
-  const rest = req.params.rest;
-  return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${rest}`);
-});
-
-
 // ----------------------------------------------------
-// Static + SPA (✅ 반드시 맨 아래)
+// Static + SPA (맨 아래)
 // ----------------------------------------------------
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
@@ -1561,12 +1414,13 @@ if (
   console.log("⚠️ IBK router disabled (env not set)");
 }
 
-// SPA 라우팅 (API 경로 제외)
-app.get(/^\/(?!auth|products|product-images|orders|head|wallet|topups|admin|profile|points|master|__whoami).*/, (req, res) => {
-  res.sendFile(path.join(distPath, "index.html"));
-});
-  
+app.get(
+  /^\/(?!auth|products|product-images|orders|head|wallet|topups|admin|profile|points|master|__whoami|__revcheck_20260122).*/,
+  (req, res) => {
+    res.sendFile(path.join(distPath, "index.html"));
+  }
+);
 
 // 서버 실행
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 서버 실행 중: 포트 ${PORT} (rev=${APP_REV})`));
