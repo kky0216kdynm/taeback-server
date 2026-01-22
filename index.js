@@ -26,10 +26,19 @@ const R2_BUCKET = process.env.R2_BUCKET || "taeback-product-images";
 const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/$/, "");
 
 // /product-images/* 요청이 오면 R2로 302 리다이렉트
-app.get("/product-images/*", (req, res) => {
+app.get("/product-images/:rest(*)", (req, res) => {
   if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
-  return res.redirect(302, `${R2_PUBLIC_BASE_URL}${req.path}`);
+
+  // 요청: /product-images/6/p75.jpg
+  // rest: 6/p75.jpg
+  const rest = req.params.rest;
+
+  // R2에 올린 키가 product-images/{hid}/p{id}.jpg 형태면 이렇게 가야 맞음
+  const target = `${R2_PUBLIC_BASE_URL}/product-images/${rest}`;
+
+  return res.redirect(302, target);
 });
+
 
 
 const r2 = new S3Client({
