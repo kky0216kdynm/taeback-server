@@ -15,6 +15,7 @@ const xlsx = require("xlsx");
 const upload = multer({ storage: multer.memoryStorage() });
 const uploadAny = multer({ storage: multer.memoryStorage() }).any();
 
+const APP_REV = process.env.APP_REV || "dev";
 
 const app = express();
 app.use(cors());
@@ -1524,9 +1525,11 @@ app.get("/__whoami", (req, res) => {
   res.json({
     ok: true,
     service: "taeback-api",
+    rev: APP_REV,
     time: new Date().toISOString(),
   });
 });
+
 // ✅ R2 image redirect (반드시 static/spa보다 위)
 app.get("/product-images/:rest(*)", (req, res) => {
   if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
