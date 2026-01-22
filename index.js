@@ -51,9 +51,13 @@ const r2 = new S3Client({
 // ✅ product-images: API에서 R2 public로 리다이렉트 (단일 정의)
 app.get("/product-images/:rest(*)", (req, res) => {
   if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
-  const rest = req.params.rest; // e.g. "6/p101.jpg"
-  return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${rest}`);
+
+  const rest = req.params.rest; // e.g. "6/갈비살.jpg" (디코딩 상태일 수 있음)
+  const safeRest = encodePathPreserveSlash(rest);
+
+  return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${safeRest}`);
 });
+
 
 // ----------------------------------------------------
 // DB
@@ -94,6 +98,20 @@ function requireMaster(req, res, next) {
 // ----------------------------------------------------
 // Utils
 // ----------------------------------------------------
+
+function isMacJunkPath(p) {
+  const s = String(p || "");
+  const base = path.basename(s);
+  return s.includes("__MACOSX/") || base === ".DS_Store" || base.startsWith("._");
+}
+
+function encodePathPreserveSlash(p) {
+  // "6/갈비살.jpg" -> "6/%EA%B0%88%EB%B9%84%EC%82%B4.jpg"
+  return String(p)
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+}
 
 function isJpeg(buf) {
   return buf && buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
@@ -1234,11 +1252,69 @@ app.post("/master/products/batch-zip", requireMaster, upload.single("file"), asy
   const allowedExt = new Set([".jpg", ".jpeg", ".png", ".webp"]);
   const imageEntries = directory.files.filter((f) => {
     if (f.type !== "File") return false;
-    if (isMacJunkPath(f.path)) return false; // ✅ 맥 쓰레기 파일 제거
+    if (isMacJunkPath(f.path)) return false; // ✅ 맥 찌꺼기 제거
     const ext = path.extname(f.path || "").toLowerCase();
-    if (!allowedExt.has(ext)) return false;
-    return true;
+    return allowedExt.has(ext);
   });
+  
+  for (const f of imageEntries) {
+    try {
+      const ext = path.extname(f.path || "").toLowerCase();
+  
+      // ✅ 파일명(확장자 제거) = 상품명으로 매칭
+      const base = path.basename(f.path || "");
+      const stem = path.basename(base, ext);
+  
+      const keyName = normalizeNameForMatch(stem);
+      const ids = latestNameKeyToIds.get(keyName) || [];
+  
+      if (ids.length === 0) {
+        report.images.skipped.push({ file: f.path, reason: "no matching product name" });
+        continue;
+      }
+      if (ids.length > 1) {
+        report.images.skipped.push({ file: f.path, reason: "ambiguous name (duplicate products)", productIds: ids });
+        continue;
+      }
+  
+      const productId = ids[0];
+      if (!latestIdSet.has(productId)) {
+        report.images.skipped.push({ file: f.path, reason: `productId=${productId} not in this headOfficeId` });
+        continue;
+      }
+  
+      const buf = await f.buffer();
+  
+      // ✅ 너무 작은 파일(212B 같은 거) 걸러내기 (가짜/깨짐 방지)
+      if (!buf || buf.length < 1024) {
+        report.images.skipped.push({ file: f.path, reason: `too small (${buf ? buf.length : 0} bytes)` });
+        continue;
+      }
+  
+      // ✅ R2에는 "원본 파일명" 그대로 저장
+      const objectKey = `product-images/${hid}/${stem}${ext}`;
+  
+      await uploadToR2({
+        key: objectKey,
+        body: buf,
+        contentType: guessContentTypeByExt(ext),
+      });
+  
+      // ✅ DB에는 API 경유 상대 경로 저장 (원본 파일명)
+      const relUrl = `/product-images/${hid}/${stem}${ext}`;
+  
+      await pool.query(
+        `UPDATE products SET image_url=$1, updated_at=now()
+         WHERE id=$2 AND head_office_id=$3`,
+        [relUrl, productId, hid]
+      );
+  
+      report.images.updated++;
+    } catch (e) {
+      report.images.skipped.push({ file: f.path, reason: "processing error", error: e.message });
+    }
+  }
+  
   
 
   for (const f of imageEntries) {
