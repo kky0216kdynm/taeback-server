@@ -1500,6 +1500,10 @@ async function migrateProductImagesForHeadOffice({ hid, isDryRun }) {
 
   return report;
 }
+app.get("/__revcheck_20260122", (req, res) => {
+  res.send("ok-20260122");
+});
+
 
 app.post("/master/products/migrate-images", requireMaster, async (req, res) => {
   const { headOfficeId, dryRun } = req.query;
