@@ -1531,12 +1531,12 @@ app.get("/__whoami", (req, res) => {
 });
 
 
-// ✅ R2 image redirect (반드시 static/spa보다 위)
-app.get("/product-images/:rest(*)", (req, res) => {
+app.get("/product-images/:rest(.*)", (req, res) => {
   if (!R2_PUBLIC_BASE_URL) return res.status(500).send("R2_PUBLIC_BASE_URL not set");
-  const rest = req.params.rest; // e.g. "6/p101.jpg"
+  const rest = req.params.rest;
   return res.redirect(302, `${R2_PUBLIC_BASE_URL}/product-images/${rest}`);
 });
+
 
 // ----------------------------------------------------
 // Static + SPA (✅ 반드시 맨 아래)
